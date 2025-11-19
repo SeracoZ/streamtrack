@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 
 from tqdm import tqdm
+import time
+import numpy as np
 
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
@@ -582,51 +584,245 @@ class SAM2VideoPredictor(SAM2Base):
 
         for frame_idx in tqdm(processing_order, desc="propagate in video"):
             pred_masks_per_obj = [None] * batch_size
-            for obj_idx in range(batch_size):
+
+            ###########################################################
+            import torch
+
+            if frame_idx % 5 == 0:
+                mem_alloc = torch.cuda.memory_allocated() / 1e9
+                mem_resvd = torch.cuda.memory_reserved() / 1e9
+                print(f"[Frame {frame_idx}] GPU allocated: {mem_alloc:.2f} GB, reserved: {mem_resvd:.2f} GB")
+
+            if frame_idx % 50 == 0:
+                torch.cuda.empty_cache()
+                for obj_idx, obj_dict in inference_state["output_dict_per_obj"].items():
+                    for out in obj_dict["non_cond_frame_outputs"].values():
+                        if "maskmem_features" in out:
+                            out["maskmem_features"] = out["maskmem_features"].cpu()
+                            out["maskmem_pos_enc"] = [x.cpu() for x in out["maskmem_pos_enc"]]
+
+
+            # --- DYNAMIC NEW OBJECT ADDITION ---
+            if "pending_new_objects" in inference_state and inference_state["pending_new_objects"]:
+                pending_list = inference_state["pending_new_objects"]
+                print(f"[Frame {frame_idx}] Processing {len(pending_list)} pending new objects...")
+
+                # 1️⃣ Extract current frame image and features
+                image_tensor = inference_state["images"][frame_idx].unsqueeze(0).to(self.device)
+                backbone_out = self.forward_image(image_tensor)
+                #vision_feats, vision_pos_embeds, feat_sizes = self._prepare_backbone_features(backbone_out)
+                vision_feats, vision_pos_embeds, feat_sizes, vision_input = self._prepare_backbone_features(
+                    backbone_out)
+
+                # Shared features for all new objects
+                cached_feats = {
+                    "vision_feats": vision_feats,
+                    "vision_pos_embeds": vision_pos_embeds,
+                    "feat_sizes": feat_sizes,
+                }
+
+                for obj_id, det_box in pending_list:
+                    print(f"   → adding ID {obj_id}")
+                    # (A) add box prompt
+                    _, _, _ = self.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=obj_id,
+                        box=torch.tensor(det_box, dtype=torch.float32, device='cpu'),
+                        clear_old_points=True,
+                        normalize_coords=True,
+                    )
+
+                    # (B) encode into memory immediately (partial preflight)
+                    obj_idx = self._obj_id_to_idx(inference_state, obj_id)
+                    out_tmp = inference_state["temp_output_dict_per_obj"][obj_idx]["cond_frame_outputs"].get(frame_idx)
+                    if out_tmp is None:
+                        continue
+
+                    high_res_masks = torch.nn.functional.interpolate(
+                        out_tmp["pred_masks"].to(inference_state["device"]),
+                        size=(self.image_size, self.image_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    maskmem_features, maskmem_pos_enc = self._run_memory_encoder(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        batch_size=1,
+                        high_res_masks=high_res_masks,
+                        object_score_logits=out_tmp["object_score_logits"],
+                        is_mask_from_pts=True,
+                    )
+                    out_tmp["maskmem_features"] = maskmem_features
+                    out_tmp["maskmem_pos_enc"] = maskmem_pos_enc
+                    inference_state["output_dict_per_obj"][obj_idx]["cond_frame_outputs"][frame_idx] = out_tmp
+                    inference_state["temp_output_dict_per_obj"][obj_idx]["cond_frame_outputs"].clear()
+
+                # (C) clear queue and refresh batch metadata
+                inference_state["pending_new_objects"].clear()
+                obj_ids = inference_state["obj_ids"]
+                batch_size = self._get_obj_num(inference_state)
+                pred_masks_per_obj = [None] * batch_size
+
+                print(f"[Frame {frame_idx}] Now tracking {batch_size} objects: {obj_ids}")
+
+
+            ###########################################################
+            removed_ids = inference_state.get("removed_obj_ids", set())
+            device = inference_state["device"]
+
+            # -------------------------------------------------------------
+            # 1️⃣ Collect active objects for batched inference
+            # -------------------------------------------------------------
+            active_obj_indices = []
+            #for obj_idx in range(batch_size):
+            for obj_idx in list(inference_state["obj_idx_to_id"].keys()):
+                obj_id = inference_state["obj_idx_to_id"][obj_idx]
+
+                # Skip removed objects
+                if obj_id in removed_ids:
+                    pred_masks_per_obj[obj_idx] = torch.full(
+                        (1, 1, self.image_size // 4, self.image_size // 4),
+                        fill_value=-32.0,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    continue
+
+                if obj_idx not in inference_state["output_dict_per_obj"]:
+                    print(f"[debug-loop] ❌ Missing obj_idx {obj_idx}")
+                    print(
+                        f"[debug-loop] Existing output_dict_per_obj keys: {list(inference_state['output_dict_per_obj'].keys())}")
+                    print(f"[debug-loop] Current obj_idx_to_id: {inference_state.get('obj_idx_to_id')}")
+                    print(f"[debug-loop] Current obj_id_to_idx: {inference_state.get('obj_id_to_idx')}")
+                    print(f"[debug-loop] Current obj_ids: {inference_state.get('obj_ids')}")
+                    raise KeyError(f"obj_idx {obj_idx} not found in output_dict_per_obj")
+
                 obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-                # We skip those frames already in consolidated outputs (these are frames
-                # that received input clicks or mask). Note that we cannot directly run
-                # batched forward on them via `_run_single_frame_inference` because the
-                # number of clicks on each object might be different.
-                if frame_idx in obj_output_dict["cond_frame_outputs"]:
+
+                # --- Frame 0 remains conditional (anchor memory) ---
+                if frame_idx == 0:
                     storage_key = "cond_frame_outputs"
+                    if frame_idx not in obj_output_dict[storage_key]:
+                        # initialize conditioning from first detection box
+                        continue
                     current_out = obj_output_dict[storage_key][frame_idx]
-                    device = inference_state["device"]
                     pred_masks = current_out["pred_masks"].to(device, non_blocking=True)
-                    if self.clear_non_cond_mem_around_input:
-                        # clear non-conditioning memory of the surrounding frames
-                        self._clear_obj_non_cond_mem_around_input(
-                            inference_state, frame_idx, obj_idx
-                        )
-                else:
-                    storage_key = "non_cond_frame_outputs"
+                    pred_masks_per_obj[obj_idx] = pred_masks
+                    continue
+
+                # all other frames go into batched inference
+                active_obj_indices.append(obj_idx)
+
+            # -------------------------------------------------------------
+            # 2️⃣ Prepare per-object conditioning dicts for batch
+            # -------------------------------------------------------------
+            if len(active_obj_indices) > 0:
+                batched_output_dicts = [
+                    {
+                        # keep each object's original conditioning frames (usually only frame 0)
+                        "cond_frame_outputs": inference_state["output_dict_per_obj"][i]["cond_frame_outputs"],
+                        "non_cond_frame_outputs": {},
+                    }
+                    for i in active_obj_indices
+                ]
+
+                # -------------------------------------------------------------
+                # 3️⃣ Run SAM2 inference once per active object (semi-batched)
+                t_track_start = time.time()
+                current_out_all, pred_masks_all = [], []
+
+                for obj_idx in active_obj_indices:
+                    obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+
                     current_out, pred_masks = self._run_single_frame_inference(
                         inference_state=inference_state,
-                        output_dict=obj_output_dict,
+                        output_dict=obj_output_dict,  # 👈 single dict (as SAM2 expects)
                         frame_idx=frame_idx,
-                        batch_size=1,  # run on the slice of a single object
+                        batch_size=1,  # 👈 one object at a time
                         is_init_cond_frame=False,
                         point_inputs=None,
                         mask_inputs=None,
                         reverse=reverse,
                         run_mem_encoder=True,
                     )
-                    obj_output_dict[storage_key][frame_idx] = current_out
+                    current_out_all.append(current_out)
+                    pred_masks_all.append(pred_masks)
 
-                inference_state["frames_tracked_per_obj"][obj_idx][frame_idx] = {
-                    "reverse": reverse
-                }
-                pred_masks_per_obj[obj_idx] = pred_masks
+                t_track_end = time.time()
+                inference_state["last_frame_track_time"] = t_track_end - t_track_start
+                print(f'inference time:{t_track_end - t_track_start}')
+
+
+                # -------------------------------------------------------------
+                # 4️⃣ Distribute batched outputs back to each object
+                # -------------------------------------------------------------
+                # combine outputs
+                for local_idx, obj_idx in enumerate(active_obj_indices):
+                    obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+                    storage_key = "non_cond_frame_outputs"
+
+                    current_out = current_out_all[local_idx]
+                    obj_output_dict[storage_key][frame_idx] = current_out
+                    pred_masks_per_obj[obj_idx] = pred_masks_all[local_idx]
+                    inference_state["frames_tracked_per_obj"][obj_idx][frame_idx] = {"reverse": reverse}
+
+                    # memory pruning
+                    nc = obj_output_dict.get("non_cond_frame_outputs", {})
+                    if len(nc) > 12:
+                        for old_k in sorted(list(nc.keys()))[:-12]:
+                            del nc[old_k]
 
             # Resize the output mask to the original video resolution (we directly use
             # the mask scores on GPU for output to avoid any CPU conversion in between)
-            if len(pred_masks_per_obj) > 1:
-                all_pred_masks = torch.cat(pred_masks_per_obj, dim=0)
+            # Filter out deleted / inactive objects
+            valid_masks = [m for m in pred_masks_per_obj if m is not None]
+            if not valid_masks:
+                print(f"[WARN] No valid masks at frame {frame_idx}, skipping frame")
+                continue
+
+            if len(valid_masks) > 1:
+                all_pred_masks = torch.cat(valid_masks, dim=0)
             else:
-                all_pred_masks = pred_masks_per_obj[0]
+                all_pred_masks = valid_masks[0]
+
             _, video_res_masks = self._get_orig_video_res_output(
                 inference_state, all_pred_masks
             )
+
+            self.remove_totally_overlapping_masks(
+                inference_state,
+                contain_thresh=0.95,
+                debug=False,
+                current_masks=video_res_masks,  # <- use current frame masks
+                current_obj_ids=obj_ids,  # <- use current frame ids
+            )
+
+            # === Handle deferred hard removals ===
+            # === Handle deferred full removals using remove_object() ===
+            if hasattr(self, "_pending_hard_remove") and self._pending_hard_remove:
+                to_remove = list(self._pending_hard_remove)
+                print(f"\n[Frame {frame_idx}] Removing overlapped objects via remove_object(): {to_remove}")
+                for rid in to_remove:
+                    try:
+                        self.remove_object(inference_state, rid, strict=False, need_output=False)
+                        print(f"[remove_object] ✅ Removed ID {rid}")
+                    except Exception as e:
+                        print(f"[remove_object] ❌ Failed for {rid}: {e}")
+
+                self._pending_hard_remove.clear()
+
+                # ✅ Rebuild index mappings after any removals
+                inference_state["obj_idx_to_id"] = OrderedDict(enumerate(inference_state["obj_ids"]))
+                inference_state["obj_id_to_idx"] = {v: k for k, v in inference_state["obj_idx_to_id"].items()}
+                print(f"[debug-fix] Rebuilt mappings: obj_idx_to_id={inference_state['obj_idx_to_id']}")
+                print(f"[debug-fix] output_dict_per_obj keys={list(inference_state['output_dict_per_obj'].keys())}")
+
+            # === Refresh obj_ids for next stage ===
+            obj_ids = inference_state["obj_ids"]
+            batch_size = self._get_obj_num(inference_state)
+
+            # === Return current frame output ===
             yield frame_idx, obj_ids, video_res_masks
 
     @torch.inference_mode()
@@ -864,6 +1060,255 @@ class SAM2VideoPredictor(SAM2Base):
         return expanded_maskmem_pos_enc
 
     @torch.inference_mode()
+    def add_object_in_propagate(
+            self,
+            inference_state,
+            obj_id,
+            frame_idx,
+            box,
+            cached_feats,
+    ):
+        """
+        Dynamically add a new object inside the propagate loop.
+        Reuses cached encoder features (no new inference).
+        """
+        # Skip if ID already exists
+        if obj_id in inference_state["obj_id_to_idx"]:
+            return inference_state
+
+        # --- 1️⃣ Register object slot ---
+        obj_idx = len(inference_state["obj_id_to_idx"])
+        inference_state["obj_id_to_idx"][obj_id] = obj_idx
+        inference_state["obj_idx_to_id"][obj_idx] = obj_id
+        inference_state["obj_ids"].append(obj_id)
+        inference_state["output_dict_per_obj"][obj_idx] = {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}}
+
+        # --- 2️⃣ Run SAM head directly (prompt = box) ---
+        _, sam_outputs, _, _ = self._track_step(
+            frame_idx=frame_idx,
+            is_init_cond_frame=True,  # acts as its first frame
+            current_vision_feats=cached_feats["vision_feats"],
+            current_vision_pos_embeds=cached_feats["vision_pos_embeds"],
+            feat_sizes=cached_feats["feat_sizes"],
+            point_inputs=None,
+            mask_inputs=None,
+            output_dict={},
+            num_frames=0,
+            track_in_reverse=False,
+            prev_sam_mask_logits=None,
+            box=torch.tensor(box, dtype=torch.float32, device=self.device).unsqueeze(0),
+        )
+
+        (
+            _,
+            _,
+            _,
+            low_res_masks,
+            high_res_masks,
+            obj_ptr,
+            object_score_logits,
+        ) = sam_outputs
+
+        # --- 3️⃣ Encode the new mask into memory ---
+        high_res_masks = torch.nn.functional.interpolate(
+            high_res_masks,
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        maskmem_features, maskmem_pos_enc = self._run_memory_encoder(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            batch_size=1,
+            high_res_masks=high_res_masks,
+            object_score_logits=object_score_logits,
+            is_mask_from_pts=True,
+        )
+
+        # --- 4️⃣ Save as cond memory for the new object ---
+        out = {
+            "pred_masks": low_res_masks,
+            "pred_masks_high_res": high_res_masks,
+            "obj_ptr": obj_ptr,
+            "maskmem_features": maskmem_features,
+            "maskmem_pos_enc": maskmem_pos_enc,
+            "object_score_logits": object_score_logits,
+        }
+        inference_state["output_dict_per_obj"][obj_idx]["cond_frame_outputs"][frame_idx] = out
+        inference_state["obj_ids"] = list(inference_state["obj_id_to_idx"])
+
+        print(f"✅ Dynamically added object {obj_id} at frame {frame_idx}")
+        return inference_state
+
+    @torch.inference_mode()
+    def soft_remove_object(self, inference_state, obj_id):
+        """
+        Softly remove an object without reindexing other objects.
+        The object will be ignored in later propagation and outputs,
+        but its index slot remains valid (so no KeyError).
+        """
+        obj_idx = inference_state["obj_id_to_idx"].get(obj_id, None)
+        if obj_idx is None:
+            print(f"[soft_remove] ⚠️ Object {obj_id} not found, skipping.")
+            return inference_state
+
+        # --- Mark as removed ---
+        if "removed_obj_ids" not in inference_state:
+            inference_state["removed_obj_ids"] = set()
+        inference_state["removed_obj_ids"].add(obj_id)
+        print(f"[soft_remove] 🚫 Soft-removed object {obj_id} (idx={obj_idx})")
+
+        # --- Clear its memory to free GPU ---
+        def _clear_container(container):
+            if obj_idx in container:
+                container[obj_idx].clear()
+
+        _clear_container(inference_state["point_inputs_per_obj"])
+        _clear_container(inference_state["mask_inputs_per_obj"])
+        if obj_idx in inference_state["output_dict_per_obj"]:
+            inference_state["output_dict_per_obj"][obj_idx]["cond_frame_outputs"].clear()
+            inference_state["output_dict_per_obj"][obj_idx]["non_cond_frame_outputs"].clear()
+        if obj_idx in inference_state["temp_output_dict_per_obj"]:
+            inference_state["temp_output_dict_per_obj"][obj_idx]["cond_frame_outputs"].clear()
+            inference_state["temp_output_dict_per_obj"][obj_idx]["non_cond_frame_outputs"].clear()
+        if obj_idx in inference_state["frames_tracked_per_obj"]:
+            inference_state["frames_tracked_per_obj"][obj_idx].clear()
+
+        torch.cuda.empty_cache()
+        return inference_state
+
+    @torch.inference_mode()
+    def hard_remove_object(self, inference_state, obj_id):
+        """
+        Completely remove an object and free all memory.
+        Unlike soft_remove_object, this deletes all references so the ID is gone.
+        """
+        obj_id_to_idx = inference_state["obj_id_to_idx"]
+        obj_idx_to_id = inference_state["obj_idx_to_id"]
+        per_obj = inference_state["output_dict_per_obj"]
+        frames_per_obj = inference_state["frames_tracked_per_obj"]
+
+        if obj_id not in obj_id_to_idx:
+            print(f"[hard_remove] ⚠️ Object {obj_id} not found.")
+            return inference_state
+
+        obj_idx = obj_id_to_idx.pop(obj_id)
+        obj_idx_to_id.pop(obj_idx, None)
+
+        # Clear memory-heavy dicts
+        obj_dict = per_obj.pop(obj_idx, None)
+        if isinstance(obj_dict, dict):
+            for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+                if key in obj_dict:
+                    for out in obj_dict[key].values():
+                        for tkey in ("maskmem_features", "maskmem_pos_enc", "pred_masks"):
+                            if tkey in out and out[tkey] is not None:
+                                out[tkey] = None
+                    obj_dict[key].clear()
+
+        frames_per_obj.pop(obj_idx, None)
+        inference_state["point_inputs_per_obj"].pop(obj_idx, None)
+        inference_state["mask_inputs_per_obj"].pop(obj_idx, None)
+        inference_state["temp_output_dict_per_obj"].pop(obj_idx, None)
+
+        # Clean bookkeeping
+        for field in ("last_seen",):
+            if field in inference_state and obj_id in inference_state[field]:
+                inference_state[field].pop(obj_id)
+        for field in ("removed_obj_ids", "occluded_ids", "pending_remove"):
+            if field in inference_state and isinstance(inference_state[field], set):
+                inference_state[field].discard(obj_id)
+
+        # Remove from global list
+        if obj_id in inference_state["obj_ids"]:
+            inference_state["obj_ids"].remove(obj_id)
+
+        torch.cuda.empty_cache()
+        print(f"[hard_remove] 🧹 Fully removed object {obj_id}")
+        return inference_state
+
+    @torch.inference_mode()
+    def remove_totally_overlapping_masks(
+            self,
+            inference_state,
+            contain_thresh: float = 0.95,
+            debug: bool = False,
+            current_masks: torch.Tensor | None = None,  # [N,1,H,W] logits at video res (this frame)
+            current_obj_ids: list[int] | None = None,
+    ):
+        """
+        Detect totally overlapping masks and MARK the smaller one for hard removal.
+        Actual removal is deferred to the end of the frame (in propagate_in_video).
+        If `current_masks` and `current_obj_ids` are provided, operate on those for this frame.
+        Otherwise, fall back to the most recent masks cached in `inference_state`.
+        """
+        # ---- get binary masks + ids ----
+        bin_masks = None
+        obj_ids = None
+
+        if current_masks is not None and current_obj_ids is not None and len(current_obj_ids) > 1:
+            # use current frame’s masks
+            with torch.no_grad():
+                bin_masks = (current_masks.detach().to("cpu") > 0).numpy().squeeze(1)  # [N,H,W]
+            obj_ids = list(current_obj_ids)
+        else:
+            # fallback to latest masks in state (older behavior)
+            if "output_dict_per_obj" not in inference_state or len(inference_state["output_dict_per_obj"]) <= 1:
+                return inference_state
+            obj_ids = list(inference_state["obj_id_to_idx"].keys())
+            masks_np = []
+            valid_ids = []
+            for oid in obj_ids:
+                oidx = inference_state["obj_id_to_idx"][oid]
+                o = inference_state["output_dict_per_obj"].get(oidx, {})
+                nonc = o.get("non_cond_frame_outputs", {})
+                cond = o.get("cond_frame_outputs", {})
+                if len(nonc) > 0:
+                    t = max(nonc.keys());
+                    m = nonc[t]["pred_masks"]
+                elif len(cond) > 0:
+                    t = max(cond.keys());
+                    m = cond[t]["pred_masks"]
+                else:
+                    continue
+                masks_np.append((m.detach().cpu().numpy() > 0).astype(np.uint8).squeeze())
+                valid_ids.append(oid)
+            if len(masks_np) <= 1:
+                return inference_state
+            bin_masks = np.stack(masks_np, 0)
+            obj_ids = valid_ids
+
+        if bin_masks is None or len(obj_ids) <= 1:
+            return inference_state
+
+        # ---- compare pairwise containment ----
+        areas = [m.sum() for m in bin_masks]
+        marked = set()
+        N = len(obj_ids)
+        for i in range(N):
+            if areas[i] == 0:
+                continue
+            for j in range(i + 1, N):
+                if areas[j] == 0:
+                    continue
+                inter = np.logical_and(bin_masks[i], bin_masks[j]).sum()
+                smaller = min(areas[i], areas[j])
+                contain = inter / smaller if smaller > 0 else 0.0
+                if contain >= contain_thresh:
+                    smaller_id = obj_ids[j] if areas[i] >= areas[j] else obj_ids[i]
+                    marked.add(smaller_id)
+                    if debug:
+                        print(f"[MaskOverlap] mark hard-remove ID {smaller_id} (contain={contain:.3f})")
+
+        # ---- stash for deferred hard removal ----
+        if not hasattr(self, "_pending_hard_remove"):
+            self._pending_hard_remove = set()
+        self._pending_hard_remove.update(marked)
+
+        return inference_state
+
+    @torch.inference_mode()
     def remove_object(self, inference_state, obj_id, strict=False, need_output=True):
         """
         Remove an object id from the tracking state. If strict is True, we check whether
@@ -971,253 +1416,3 @@ class SAM2VideoPredictor(SAM2Base):
             non_cond_frame_outputs = obj_output_dict["non_cond_frame_outputs"]
             for t in range(frame_idx_begin, frame_idx_end + 1):
                 non_cond_frame_outputs.pop(t, None)
-
-
-class SAM2VideoPredictorVOS(SAM2VideoPredictor):
-    """Optimized for the VOS setting"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._compile_all_components()
-
-    def _compile_all_components(self):
-        print("Compiling all components for VOS setting. First time may be very slow.")
-        self.memory_encoder.forward = torch.compile(
-            self.memory_encoder.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=False,
-        )
-
-        self.memory_attention.forward = torch.compile(
-            self.memory_attention.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=True,  # Num. of memories varies
-        )
-
-        self.sam_prompt_encoder.forward = torch.compile(
-            self.sam_prompt_encoder.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=False,  # Accuracy regression on True
-        )
-
-        self.sam_mask_decoder.forward = torch.compile(
-            self.sam_mask_decoder.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=False,  # Accuracy regression on True
-        )
-
-    def forward_image(self, img_batch: torch.Tensor):
-        """
-        Identical to the corresponding method in the parent (SAM2VideoPredictor), but
-        cloning the backbone features and pos encoding to enable compilation.
-        """
-        backbone_out = self.image_encoder(img_batch)
-        if self.use_high_res_features_in_sam:
-            # precompute projected level 0 and level 1 features in SAM decoder
-            # to avoid running it again on every SAM click
-            backbone_out["backbone_fpn"][0] = self.sam_mask_decoder.conv_s0(
-                backbone_out["backbone_fpn"][0]
-            )
-            backbone_out["backbone_fpn"][1] = self.sam_mask_decoder.conv_s1(
-                backbone_out["backbone_fpn"][1]
-            )
-        # Clone to help torch.compile
-        for i in range(len(backbone_out["backbone_fpn"])):
-            backbone_out["backbone_fpn"][i] = backbone_out["backbone_fpn"][i].clone()
-            backbone_out["vision_pos_enc"][i] = backbone_out["vision_pos_enc"][
-                i
-            ].clone()
-        return backbone_out
-
-    def _forward_sam_heads(
-        self,
-        backbone_features,
-        point_inputs=None,
-        mask_inputs=None,
-        high_res_features=None,
-        multimask_output=False,
-    ):
-        """
-        Identical to the corresponding method in the parent (SAM2VideoPredictor), but
-        cloning the outputs of prompt_encoder and mask_decoder to enable compilation.
-        """
-        B = backbone_features.size(0)
-        device = backbone_features.device
-        assert backbone_features.size(1) == self.sam_prompt_embed_dim
-        assert backbone_features.size(2) == self.sam_image_embedding_size
-        assert backbone_features.size(3) == self.sam_image_embedding_size
-
-        # a) Handle point prompts
-        if point_inputs is not None:
-            sam_point_coords = point_inputs["point_coords"]
-            sam_point_labels = point_inputs["point_labels"]
-            assert sam_point_coords.size(0) == B and sam_point_labels.size(0) == B
-        else:
-            # If no points are provide, pad with an empty point (with label -1)
-            sam_point_coords = torch.zeros(B, 1, 2, device=device)
-            sam_point_labels = -torch.ones(B, 1, dtype=torch.int32, device=device)
-
-        # b) Handle mask prompts
-        if mask_inputs is not None:
-            # If mask_inputs is provided, downsize it into low-res mask input if needed
-            # and feed it as a dense mask prompt into the SAM mask encoder
-            assert len(mask_inputs.shape) == 4 and mask_inputs.shape[:2] == (B, 1)
-            if mask_inputs.shape[-2:] != self.sam_prompt_encoder.mask_input_size:
-                sam_mask_prompt = F.interpolate(
-                    mask_inputs.float(),
-                    size=self.sam_prompt_encoder.mask_input_size,
-                    align_corners=False,
-                    mode="bilinear",
-                    antialias=True,  # use antialias for downsampling
-                )
-            else:
-                sam_mask_prompt = mask_inputs
-        else:
-            # Otherwise, simply feed None (and SAM's prompt encoder will add
-            # a learned `no_mask_embed` to indicate no mask input in this case).
-            sam_mask_prompt = None
-
-        sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
-            points=(sam_point_coords, sam_point_labels),
-            boxes=None,
-            masks=sam_mask_prompt,
-        )
-        # Clone image_pe and the outputs of sam_prompt_encoder
-        # to enable compilation
-        sparse_embeddings = sparse_embeddings.clone()
-        dense_embeddings = dense_embeddings.clone()
-        image_pe = self.sam_prompt_encoder.get_dense_pe().clone()
-        (
-            low_res_multimasks,
-            ious,
-            sam_output_tokens,
-            object_score_logits,
-        ) = self.sam_mask_decoder(
-            image_embeddings=backbone_features,
-            image_pe=image_pe,
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-            repeat_image=False,  # the image is already batched
-            high_res_features=high_res_features,
-        )
-        # Clone the output of sam_mask_decoder
-        # to enable compilation
-        low_res_multimasks = low_res_multimasks.clone()
-        ious = ious.clone()
-        sam_output_tokens = sam_output_tokens.clone()
-        object_score_logits = object_score_logits.clone()
-
-        if self.pred_obj_scores:
-            is_obj_appearing = object_score_logits > 0
-
-            # Mask used for spatial memories is always a *hard* choice between obj and no obj,
-            # consistent with the actual mask prediction
-            low_res_multimasks = torch.where(
-                is_obj_appearing[:, None, None],
-                low_res_multimasks,
-                NO_OBJ_SCORE,
-            )
-
-        # convert masks from possibly bfloat16 (or float16) to float32
-        # (older PyTorch versions before 2.1 don't support `interpolate` on bf16)
-        low_res_multimasks = low_res_multimasks.float()
-        high_res_multimasks = F.interpolate(
-            low_res_multimasks,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        sam_output_token = sam_output_tokens[:, 0]
-        if multimask_output:
-            # take the best mask prediction (with the highest IoU estimation)
-            best_iou_inds = torch.argmax(ious, dim=-1)
-            batch_inds = torch.arange(B, device=device)
-            low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            if sam_output_tokens.size(1) > 1:
-                sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
-        else:
-            low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
-
-        # Extract object pointer from the SAM output token (with occlusion handling)
-        obj_ptr = self.obj_ptr_proj(sam_output_token)
-        if self.pred_obj_scores:
-            # Allow *soft* no obj ptr, unlike for masks
-            if self.soft_no_obj_ptr:
-                lambda_is_obj_appearing = object_score_logits.sigmoid()
-            else:
-                lambda_is_obj_appearing = is_obj_appearing.float()
-
-            if self.fixed_no_obj_ptr:
-                obj_ptr = lambda_is_obj_appearing * obj_ptr
-            obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
-
-        return (
-            low_res_multimasks,
-            high_res_multimasks,
-            ious,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        )
-
-    def _encode_new_memory(
-        self,
-        current_vision_feats,
-        feat_sizes,
-        pred_masks_high_res,
-        object_score_logits,
-        is_mask_from_pts,
-    ):
-        """
-        Identical to the corresponding method in the parent (SAM2VideoPredictor), but
-        cloning the memories and their pos enc to enable compilation.
-        """
-        B = current_vision_feats[-1].size(1)  # batch size on this frame
-        C = self.hidden_dim
-        H, W = feat_sizes[-1]  # top-level (lowest-resolution) feature size
-        # top-level feature, (HW)BC => BCHW
-        pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
-        if self.non_overlap_masks_for_mem_enc and not self.training:
-            # optionally, apply non-overlapping constraints to the masks (it's applied
-            # in the batch dimension and should only be used during eval, where all
-            # the objects come from the same video under batch size 1).
-            pred_masks_high_res = self._apply_non_overlapping_constraints(
-                pred_masks_high_res
-            )
-        # scale the raw mask logits with a temperature before applying sigmoid
-        binarize = self.binarize_mask_from_pts_for_mem_enc and is_mask_from_pts
-        if binarize and not self.training:
-            mask_for_mem = (pred_masks_high_res > 0).float()
-        else:
-            # apply sigmoid on the raw mask logits to turn them into range (0, 1)
-            mask_for_mem = torch.sigmoid(pred_masks_high_res)
-        # apply scale and bias terms to the sigmoid probabilities
-        if self.sigmoid_scale_for_mem_enc != 1.0:
-            mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
-        if self.sigmoid_bias_for_mem_enc != 0.0:
-            mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
-        maskmem_out = self.memory_encoder(
-            pix_feat, mask_for_mem, skip_mask_sigmoid=True  # sigmoid already applied
-        )
-        # Clone the feats and pos_enc to enable compilation
-        maskmem_features = maskmem_out["vision_features"].clone()
-        maskmem_pos_enc = [m.clone() for m in maskmem_out["vision_pos_enc"]]
-        # add a no-object embedding to the spatial memory to indicate that the frame
-        # is predicted to be occluded (i.e. no object is appearing in the frame)
-        if self.no_obj_embed_spatial is not None:
-            is_obj_appearing = (object_score_logits > 0).float()
-            maskmem_features += (
-                1 - is_obj_appearing[..., None, None]
-            ) * self.no_obj_embed_spatial[..., None, None].expand(
-                *maskmem_features.shape
-            )
-
-        return maskmem_features, maskmem_pos_enc

@@ -9,3 +9,11 @@ _C.*
 outputs/*
 checkpoints/*.pt
 demo/backend/checkpoints/*.pt
+detections_yolox_x/
+vis_results/
+bbox_vis/
+pose_vis/
+results/
+submit/
+submit_results/
+
