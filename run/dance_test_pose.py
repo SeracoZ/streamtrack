@@ -8,18 +8,17 @@ import cv2
 
 from sam2.build_sam import build_sam2_video_predictor
 from ultralytics import YOLO
+from occlusion import compute_occlusion_for_objects, attach_occlusion_to_inference_state
 
 
 
 def visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors, save_path=None):
-    """
-    Draw SAM2 masks & boxes for all active objects and save to file (no display).
-    """
     out_mask_logits = out_mask_logits.detach().cpu()
 
     def get_color(obj_id):
         if obj_id not in id_colors:
-            id_colors[obj_id] = tuple(int(c) for c in np.random.randint(0, 255, 3))
+            rng = np.random.default_rng(seed=obj_id * 99991)
+            id_colors[obj_id] = tuple(int(c) for c in rng.integers(0, 255, size=3))
         return id_colors[obj_id]
 
     for i, obj_id in enumerate(out_obj_ids):
@@ -41,7 +40,6 @@ def visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors, save_path
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         cv2.imwrite(save_path, frame)
-
 
 # --- IOU helper ---
 def iou(a, b):
@@ -301,6 +299,21 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
                 x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
                 existing_boxes.append([x1, y1, x2, y2])
 
+            # === Compute occlusion using YOLO detections ===
+            occlusion_list = compute_occlusion_for_objects(
+                existing_boxes=existing_boxes,
+                det_boxes=cur_boxes,
+                det_scores=scores_f
+            )
+
+            # === Attach occlusion info directly into SAM2's memory structure ===
+            attach_occlusion_to_inference_state(
+                inference_state=inference_state,
+                occlusion_list=occlusion_list,
+                out_obj_ids=out_obj_ids,
+                rel_idx=rel_idx
+            )
+
             # === CLEANUP PHASE ===
             DISAPPEAR_THRESH = 10
             HIGH_IOU_THRESH = 0.9
@@ -410,7 +423,7 @@ def main():
         if not os.path.isdir(img_dir):
             continue
         #test_list = sorted(os.listdir(split_dir))[11]
-        test_list = sorted(os.listdir(split_dir))[0]
+        test_list = sorted(os.listdir(split_dir))[1]
         if seq not in test_list:
             continue
 
@@ -471,7 +484,7 @@ if __name__ == "__main__":
 
     # DanceTrack root
     dancetrack_root = "/home/seraco/Project/data/MOT/dancetrack"
-    split = "train_part"  # change to "train" or "test" as needed
+    split = "train"  # change to "train" or "test" as needed
     split_dir = os.path.join(dancetrack_root, split)
 
     MAX_DIRECT = 1300  # threshold for direct processing

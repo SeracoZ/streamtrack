@@ -17,6 +17,8 @@ import numpy as np
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
 
+from memory_controller import MemoryController
+
 
 class SAM2VideoPredictor(SAM2Base):
     """The predictor class to handle user interactions and manage inference states."""
@@ -798,7 +800,6 @@ class SAM2VideoPredictor(SAM2Base):
                 current_obj_ids=obj_ids,  # <- use current frame ids
             )
 
-            # === Handle deferred hard removals ===
             # === Handle deferred full removals using remove_object() ===
             if hasattr(self, "_pending_hard_remove") and self._pending_hard_remove:
                 to_remove = list(self._pending_hard_remove)
