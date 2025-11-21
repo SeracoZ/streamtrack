@@ -770,10 +770,43 @@ class SAM2VideoPredictor(SAM2Base):
                     inference_state["frames_tracked_per_obj"][obj_idx][frame_idx] = {"reverse": reverse}
 
                     # memory pruning
-                    nc = obj_output_dict.get("non_cond_frame_outputs", {})
+                    # === MEMORY PRUNE + CLEAN OUTPUTS ===
+                    nc = obj_output_dict["non_cond_frame_outputs"]
+                    cond = obj_output_dict["cond_frame_outputs"]
+
+                    # Keep ONLY last 12 non_cond frames
                     if len(nc) > 12:
-                        for old_k in sorted(list(nc.keys()))[:-12]:
-                            del nc[old_k]
+                        sorted_keys = sorted(nc.keys())
+                        prune_candidates = sorted_keys[:-12]  # frames older than t-12
+
+                        obj_id = inference_state["obj_idx_to_id"][obj_idx]
+
+                        for f in prune_candidates:
+                            qinfo = nc[f].get("quality", None)
+
+                            # No quality info? treat as low quality
+                            if qinfo is None:
+                                print(f"[MEMORY] Pruned frame {f} (NO quality info) for ID {obj_id}")
+                                nc.pop(f)
+                                continue
+
+                            q = qinfo.get("final_quality", 0.0)
+                            is_good = q >= 0.70
+
+                            if is_good:
+                                # Promote to cond_frame
+                                print(f"[MEMORY] ADD cond_frame {f} for ID {obj_id} | q={q:.3f}")
+                                cond[f] = nc.pop(f)
+
+                            else:
+                                # Remove low-quality frame
+                                print(f"[MEMORY] PRUNE low-quality {f} for ID {obj_id} | q={q:.3f}")
+                                nc.pop(f)
+
+                    #nc = obj_output_dict.get("non_cond_frame_outputs", {})
+                    #if len(nc) > 12:
+                        #for old_k in sorted(list(nc.keys()))[:-12]:
+                            #del nc[old_k]
 
             # Resize the output mask to the original video resolution (we directly use
             # the mask scores on GPU for output to avoid any CPU conversion in between)
