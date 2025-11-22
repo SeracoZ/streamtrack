@@ -786,7 +786,7 @@ class SAM2VideoPredictor(SAM2Base):
 
                             # No quality info? treat as low quality
                             if qinfo is None:
-                                print(f"[MEMORY] Pruned frame {f} (NO quality info) for ID {obj_id}")
+                                #print(f"[MEMORY] Pruned frame {f} (NO quality info) for ID {obj_id}")
                                 nc.pop(f)
                                 continue
 
@@ -795,13 +795,29 @@ class SAM2VideoPredictor(SAM2Base):
 
                             if is_good:
                                 # Promote to cond_frame
-                                print(f"[MEMORY] ADD cond_frame {f} for ID {obj_id} | q={q:.3f}")
+                                #print(f"[MEMORY] ADD cond_frame {f} for ID {obj_id} | q={q:.3f}")
                                 cond[f] = nc.pop(f)
 
                             else:
                                 # Remove low-quality frame
-                                print(f"[MEMORY] PRUNE low-quality {f} for ID {obj_id} | q={q:.3f}")
+                                #print(f"[MEMORY] PRUNE low-quality {f} for ID {obj_id} | q={q:.3f}")
                                 nc.pop(f)
+
+                        # Enforce a hard cap on cond frames (keep best/recent 5)
+                        if len(cond) > 5:
+                            scored_frames = []
+                            for cf, data in cond.items():
+                                cq = data.get("quality", {}).get("final_quality", 0.0)
+                                scored_frames.append((cq, cf))
+
+                            # sort by quality desc, then frame idx desc (newer preferred)
+                            scored_frames.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                            keep_frames = {f for _, f in scored_frames[:5]}
+
+                            for cf in list(cond.keys()):
+                                if cf not in keep_frames:
+                                    #print(f"[MEMORY] DROP cond_frame {cf} for ID {obj_id} (cap 5)")
+                                    cond.pop(cf, None)
 
                     #nc = obj_output_dict.get("non_cond_frame_outputs", {})
                     #if len(nc) > 12:

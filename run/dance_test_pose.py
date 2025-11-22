@@ -5,6 +5,8 @@ import torch
 from tqdm import tqdm
 import cv2
 
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from sam2.build_sam import build_sam2_video_predictor
 from ultralytics import YOLO
@@ -83,6 +85,8 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
             frame_path = os.path.join(video_path, frame_names[rel_idx])
             frame = cv2.imread(frame_path)
 
+            if rel_idx == 30:
+                print('Time to debug')
             # YOLO detect every frame
             results = det_model(frame_path, verbose=False)[0]
 
@@ -211,7 +215,23 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
             pending_new = []
             for det_box in cur_boxes:
                 overlaps = [iou(det_box, ebox) for ebox in existing_boxes]
-                if not overlaps or max(overlaps) < 0.4:
+                best_iou = max(overlaps) if overlaps else 0.0
+
+                # Skip boxes that heavily overlap or are mostly contained inside a larger tracked box
+                det_area = (det_box[2] - det_box[0]) * (det_box[3] - det_box[1])
+                contained_by_larger = False
+                for ebox in existing_boxes:
+                    ex_area = (ebox[2] - ebox[0]) * (ebox[3] - ebox[1])
+                    inter_x1 = max(det_box[0], ebox[0])
+                    inter_y1 = max(det_box[1], ebox[1])
+                    inter_x2 = min(det_box[2], ebox[2])
+                    inter_y2 = min(det_box[3], ebox[3])
+                    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+                    if det_area > 0 and inter_area / det_area > 0.6 and det_area < ex_area:
+                        contained_by_larger = True
+                        break
+
+                if best_iou < 0.3 and not contained_by_larger:
                     new_id = max(seen_ids) + 1 if seen_ids else 1
                     tqdm.write(f"🟢 Candidate new object {new_id} at frame {rel_idx}")
                     pending_new.append((new_id, det_box))
