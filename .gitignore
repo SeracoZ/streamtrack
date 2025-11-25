@@ -17,4 +17,5 @@ results/
 submit/
 submit_results/
 tmp_chunk/
-
+score_distribution/
+kf_vis/

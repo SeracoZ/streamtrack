@@ -15,7 +15,7 @@ from filter import clean_mask
 from vis import draw_score_on_frame, visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
 
 
-def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=True, quiet=False):
+def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quiet=False):
     """Run SAM2+YOLO tracking with tqdm progress and frame saving only."""
     inference_state = predictor.init_state(video_path=video_path)
     predictor.reset_state(inference_state)
@@ -212,7 +212,7 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
                 if len(x) == 0: continue
                 x1, y1, x2, y2 = min(x), min(y), max(x), max(y)
                 w, h = x2 - x1, y2 - y1
-                writer.write(f"{rel_idx + 1 + offset},{tid},{x1},{y1},{w},{h},1,-1,-1,-1\n")
+                writer.write(f"{rel_idx + 1},{tid},{x1},{y1},{w},{h},1,-1,-1,-1\n")
 
             '''
             # --- Write results ---
@@ -229,7 +229,7 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
 
             # --- Save visualization frame only (no display) ---
             if save_vis:
-                save_path = os.path.join(vis_dir, f"{rel_idx+offset:06d}.jpg")
+                save_path = os.path.join(vis_dir, f"{rel_idx:06d}.jpg")
                 visualize_tracking(frame, final_ids, final_logits, id_colors,
                                    save_path=save_path)
                 #visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors,
@@ -249,10 +249,10 @@ def main():
         img_dir = os.path.join(split_dir, seq, "img1")
         if not os.path.isdir(img_dir):
             continue
-
-        #test_list = sorted(os.listdir(split_dir))[20]
-        #if seq not in test_list:
-            #continue
+        #test_list = sorted(os.listdir(split_dir))[11]
+        test_list = sorted(os.listdir(split_dir))[1]
+        if seq not in test_list:
+            continue
 
         print(f"\n=== Processing sequence: {seq} ===")
         frame_names = sorted(
@@ -270,15 +270,7 @@ def main():
             # Direct mode
             if num_frames <= MAX_DIRECT:
                 print(f" → Direct processing ({num_frames} frames)")
-                run_sequence(
-                    predictor,
-                    img_dir,
-                    frame_names,
-                    writer=f,
-                    offset=0,
-                    save_vis=False,
-                    quiet=False
-                )
+                run_sequence(predictor, img_dir, frame_names, writer=f, save_vis=True, quiet=False)
 
             # Sliding mode
             else:
@@ -293,30 +285,22 @@ def main():
                           f"(frames {frame_idx+1}-{min(frame_idx+SLIDE_SIZE, num_frames)})")
 
                     # prepare tmp dir
-                    tmp_dir = os.path.join(TMP_DIR, f"{seq}_slice_{slice_idx}")
-                    if os.path.exists(tmp_dir):
-                        shutil.rmtree(tmp_dir)
-                    os.makedirs(tmp_dir, exist_ok=True)
+                    if os.path.exists(TMP_DIR):
+                        shutil.rmtree(TMP_DIR)
+                    os.makedirs(TMP_DIR, exist_ok=True)
 
                     for fn in slice_frames:
                         os.symlink(os.path.join(img_dir, fn),
-                                   os.path.join(tmp_dir, fn))
+                                   os.path.join(TMP_DIR, fn))
 
-                    run_sequence(
-                        predictor,
-                        tmp_dir,
-                        slice_frames,
-                        offset=frame_idx,
-                        writer=f,
-                        save_vis=False,
-                        quiet=False
-                    )
+                    run_sequence(predictor, TMP_DIR, slice_frames, offset=frame_idx, writer=f)
 
-                    shutil.rmtree(tmp_dir)
+                    shutil.rmtree(TMP_DIR)
                     frame_idx += SLIDE_SIZE
                     slice_idx += 1
 
         print(f"Saved results to {out_file}")
+
 if __name__ == "__main__":
     device = torch.device("cuda")
 
@@ -327,7 +311,7 @@ if __name__ == "__main__":
 
     # DanceTrack root
     dancetrack_root = "/home/seraco/Project/data/MOT/dancetrack"
-    split = "test"  # change to "train" or "test" as needed
+    split = "exp"  # change to "train" or "test" as needed
     split_dir = os.path.join(dancetrack_root, split)
 
     MAX_DIRECT = 1300  # threshold for direct processing

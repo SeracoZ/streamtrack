@@ -1,96 +1,215 @@
+import torch
+import torch.nn.functional as F
 import numpy as np
+from collections import defaultdict, deque
 
-class MemoryController:
-    def __init__(self, promote_gate=8, iou_thresh=0.4, area_jump=0.4):
-        self.promote_gate = promote_gate   # N frames stable → promote t-N
-        self.iou_thresh = iou_thresh       # min IOU for “good frame”
-        self.area_jump = area_jump         # max area jump ratio
-        self.prev_boxes = {}               # previous frame boxes
-        self.good_count = {}               # sliding counter
 
-    # ------------------------
-    # Utility Functions
-    # ------------------------
-    def _mask_to_box(self, mask):
-        ys, xs = np.where(mask > 0)
+class ConsistencyVerifier:
+    """
+    Detects:
+      1) Occlusion → stop memory update
+      2) ID switch → reassign to correct ID
+    Using MULTI-FRAME history, not just last frame.
+
+    History includes:
+        - past obj_ptr (appearance)
+        - past bbox center & area (geometry)
+        - past IoU trends
+        - visibility score trend
+    """
+
+    def __init__(
+        self,
+        hist_len=5,
+        tau_visibility=0.25,
+        tau_app_low=0.45,
+        tau_iou_low=0.1,
+        tau_switch_margin=0.20,
+    ):
+        self.hist_len = hist_len
+        self.tau_visibility = tau_visibility
+        self.tau_app_low = tau_app_low
+        self.tau_iou_low = tau_iou_low
+        self.tau_switch_margin = tau_switch_margin
+
+        # track_id → history buffers
+        self.hist_ptr = defaultdict(lambda: deque(maxlen=hist_len))
+        self.hist_bbox = defaultdict(lambda: deque(maxlen=hist_len))
+        self.hist_iou = defaultdict(lambda: deque(maxlen=hist_len))
+        self.hist_vis = defaultdict(lambda: deque(maxlen=hist_len))
+
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def cosine(a, b):
+        if a is None or b is None:
+            return 0.0
+        return F.cosine_similarity(a, b, dim=-1).item()
+
+    @staticmethod
+    def mask_to_bbox(mask):
+        ys, xs = np.where(mask)
         if len(xs) == 0:
             return None
-        return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+        return [
+            float(xs.min()), float(ys.min()),
+            float(xs.max()), float(ys.max())
+        ]
 
-    def _iou(self, a, b):
-        if a is None or b is None:
-            return 0
-        xA, yA = max(a[0], b[0]), max(a[1], b[1])
-        xB, yB = min(a[2], b[2]), min(a[3], b[3])
+    @staticmethod
+    def bbox_center_area(bbox):
+        if bbox is None:
+            return (0, 0, 0)
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        area = max((x2 - x1) * (y2 - y1), 1e-6)
+        return cx, cy, area
+
+    @staticmethod
+    def bbox_iou(b1, b2):
+        if b1 is None or b2 is None:
+            return 0.0
+        xA = max(b1[0], b2[0])
+        yA = max(b1[1], b2[1])
+        xB = min(b1[2], b2[2])
+        yB = min(b1[3], b2[3])
         inter = max(0, xB - xA) * max(0, yB - yA)
-        areaA = (a[2]-a[0])*(a[3]-a[1])
-        areaB = (b[2]-b[0])*(b[3]-b[1])
-        union = areaA + areaB - inter
-        return inter / union if union > 0 else 0
+        area1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
+        area2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
+        union = area1 + area2 - inter
+        if union <= 0:
+            return 0.0
+        return inter / union
 
-    def _is_good_frame(self, prev_box, new_box):
-        if prev_box is None or new_box is None:
-            return False
-        iou = self._iou(prev_box, new_box)
-        if iou < self.iou_thresh:
-            return False
-        areaA = (prev_box[2]-prev_box[0])*(prev_box[3]-prev_box[1])
-        areaB = (new_box[2]-new_box[0])*(new_box[3]-new_box[1])
-        if abs(areaA - areaB) / max(areaA, 1) > self.area_jump:
-            return False
-        return True
+    # ----------------------------------------------------------------------
+    # Main update — store history for future checks
+    # ----------------------------------------------------------------------
 
-    # ------------------------
-    # Promotion of memory
-    # ------------------------
-    def _promote_non_cond(self, inference_state, obj_id, promote_frame):
-        obj_idx = inference_state["obj_id_to_idx"].get(obj_id, None)
-        if obj_idx is None:
+    def update_prev(self, track_id, obj_ptr, mask_np, score_logit):
+        bbox = self.mask_to_bbox(mask_np)
+        vis = float(torch.sigmoid(score_logit).item())
+
+        # append to history
+        self.hist_ptr[track_id].append(obj_ptr.detach().cpu())
+        self.hist_bbox[track_id].append(bbox)
+        self.hist_vis[track_id].append(vis)
+
+        # compute IoU with last frame for trend analysis
+        if len(self.hist_bbox[track_id]) >= 2:
+            b2 = self.hist_bbox[track_id][-1]
+            b1 = self.hist_bbox[track_id][-2]
+            iou = self.bbox_iou(b1, b2)
+            self.hist_iou[track_id].append(iou)
+        else:
+            self.hist_iou[track_id].append(1.0)
+
+    # ----------------------------------------------------------------------
+    # Occlusion check with trend
+    # ----------------------------------------------------------------------
+
+    def check_occlusion(self, track_id):
+        vis_hist = self.hist_vis[track_id]
+        if len(vis_hist) == 0:
             return False
-        obj_dict = inference_state["output_dict_per_obj"][obj_idx]
 
-        nc = obj_dict["non_cond_frame_outputs"]
-        cond = obj_dict["cond_frame_outputs"]
+        # Current visibility
+        curr_vis = vis_hist[-1]
 
-        if promote_frame in nc:
-            cond[promote_frame] = nc.pop(promote_frame)
-            print(f"[MemoryController] PROMOTED frame {promote_frame} → cond_frame (obj {obj_id})")
+        # sudden drop AND below threshold → occlusion
+        if curr_vis < self.tau_visibility:
             return True
+
+        # If last 2-3 vis values are decaying → occlusion
+        if len(vis_hist) >= 3:
+            if vis_hist[-1] < vis_hist[-2] < vis_hist[-3]:
+                if vis_hist[-1] < self.tau_visibility + 0.1:
+                    return True
+
         return False
 
-    # ------------------------
-    # MAIN UPDATE CALL
-    # Called each frame after propagate_in_video yields results
-    # ------------------------
-    def update(self, inference_state, frame_idx, obj_ids, masks):
+    # ----------------------------------------------------------------------
+    # Multi-frame ID check
+    # ----------------------------------------------------------------------
+
+    def multi_frame_app_similarity(self, track_id, obj_ptr):
         """
-        masks: [N, 1, H, W] numpy or torch (video_res_masks)
+        Compare obj_ptr with average of last N ptr embeddings.
         """
+        ptr_hist = self.hist_ptr[track_id]
+        if len(ptr_hist) == 0:
+            return 1.0
+        mean_prev = torch.stack(list(ptr_hist)).mean(dim=0)
+        return self.cosine(obj_ptr.cpu(), mean_prev)
 
-        masks_np = masks.detach().cpu().numpy().squeeze(1)
+    def multi_frame_motion_iou(self, track_id, curr_bbox):
+        """
+        Compare current bbox with previous N bboxes (mean IoU).
+        """
+        bbox_hist = self.hist_bbox[track_id]
+        if len(bbox_hist) == 0:
+            return 1.0
+        ious = [self.bbox_iou(curr_bbox, b) for b in bbox_hist]
+        return float(sum(ious) / len(ious))
 
-        for obj_id, mask in zip(obj_ids, masks_np):
-            # Init tracking structures if first time
-            if obj_id not in self.prev_boxes:
-                self.prev_boxes[obj_id] = None
-            if obj_id not in self.good_count:
-                self.good_count[obj_id] = 0
+    def check_id_switch(self, track_id, obj_ptr, mask_np):
+        if len(self.hist_ptr[track_id]) == 0:
+            return track_id
 
-            # Extract bbox
-            new_box = self._mask_to_box(mask)
-            prev_box = self.prev_boxes[obj_id]
+        curr_bbox = self.mask_to_bbox(mask_np)
 
-            # Evaluate quality
-            if self._is_good_frame(prev_box, new_box):
-                self.good_count[obj_id] += 1
-            else:
-                self.good_count[obj_id] = 0
+        # (A) Multi-frame appearance similarity
+        sim_app = self.multi_frame_app_similarity(track_id, obj_ptr)
 
-            # Attempt promotion when stable
-            if self.good_count[obj_id] >= self.promote_gate:
-                promote_frame = frame_idx - self.promote_gate
-                self._promote_non_cond(inference_state, obj_id, promote_frame)
-                self.good_count[obj_id] = 0
+        # (B) Multi-frame IoU / geometry continuity
+        sim_iou = self.multi_frame_motion_iou(track_id, curr_bbox)
 
-            # Update stored state
-            self.prev_boxes[obj_id] = new_box
+        mismatch = (sim_app < self.tau_app_low and sim_iou < self.tau_iou_low)
+
+        if not mismatch:
+            return track_id
+
+        # Cross-track reassign
+        best_id = track_id
+        best_score = sim_app
+
+        for other_id in self.hist_ptr:
+            if other_id == track_id:
+                continue
+
+            sim_app2 = self.multi_frame_app_similarity(other_id, obj_ptr)
+
+            if sim_app2 - best_score > self.tau_switch_margin:
+                best_score = sim_app2
+                best_id = other_id
+
+        if best_id != track_id:
+            print(f"[Verifier] ID CORRECTED: {track_id} → {best_id}")
+
+        return best_id
+
+    # ----------------------------------------------------------------------
+    # API exposed to SAM2 tracker
+    # ----------------------------------------------------------------------
+
+    def analyze(self, track_id, obj_ptr, score_logit, mask_np):
+        """
+        Uses multi-frame occlusion + multi-frame ID consistency.
+        """
+        # 1) Update history first (but temporarily)
+        self.update_prev(track_id, obj_ptr, mask_np, score_logit)
+
+        # 2) Occlusion detection
+        if self.check_occlusion(track_id):
+            return {
+                "is_occluded": True,
+                "correct_id": track_id
+            }
+
+        # 3) ID-switch detection
+        correct_id = self.check_id_switch(track_id, obj_ptr, mask_np)
+
+        return {
+            "is_occluded": False,
+            "correct_id": correct_id
+        }
