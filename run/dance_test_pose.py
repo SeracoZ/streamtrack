@@ -250,9 +250,9 @@ def main():
         if not os.path.isdir(img_dir):
             continue
 
-        #test_list = sorted(os.listdir(split_dir))[20]
-        #if seq not in test_list:
-            #continue
+        test_list = sorted(os.listdir(split_dir))[7]
+        if seq not in test_list:
+            continue
 
         print(f"\n=== Processing sequence: {seq} ===")
         frame_names = sorted(
@@ -276,7 +276,7 @@ def main():
                     frame_names,
                     writer=f,
                     offset=0,
-                    save_vis=False,
+                    save_vis=True,
                     quiet=False
                 )
 
