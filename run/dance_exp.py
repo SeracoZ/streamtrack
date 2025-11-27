@@ -12,14 +12,18 @@ from sam2.build_sam import build_sam2_video_predictor
 from ultralytics import YOLO
 
 from filter import clean_mask
-from kf import LightKalman
-from vis import draw_score_on_frame, visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
+from add import add_new_objects
+from vis import visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
 
 
 def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quiet=False):
     """Run SAM2+YOLO tracking with tqdm progress and frame saving only."""
     inference_state = predictor.init_state(video_path=video_path)
     predictor.reset_state(inference_state)
+
+    # --- NEW: candidate buffer for strict adding ---
+    if "candidate_new" not in inference_state:
+        inference_state["candidate_new"] = {}  # cid → {box, hit, last_frame}
 
     # --- Initial detection ---
     first_frame = os.path.join(video_path, frame_names[0])
@@ -33,7 +37,7 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
 
     bboxes = []
     for i in range(len(boxes)):
-        if int(classes[i]) != 0 or scores[i] < 0.4:
+        if int(classes[i]) != 0 or scores[i] < 0.2:
             continue
         if not is_full_body(kpts_conf[i]):
             continue
@@ -46,24 +50,17 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
         )
         bboxes.append(new_box)
 
-    bboxes = filter_overlapping_bboxes(bboxes, contain_thresh=0.9)
+    #bboxes = filter_overlapping_bboxes(bboxes, contain_thresh=0.9)
 
     if not bboxes:
         print("⚠️ No person detected, skipping...")
         return
 
     id_colors, seen_ids = {}, set()
-    inference_state["kf_states"] = {}  # obj_id -> LightKalman
-    inference_state["kf_pred_box"] = {}  # obj_id -> [x1,y1,x2,y2]
-    inference_state["last_box"] = {}  # optional: last observed SAM2 box
-
     for obj_id, box in enumerate(bboxes, start=1):
         predictor.add_new_points_or_box(inference_state, frame_idx=0,
                                         obj_id=obj_id, box=np.array(box, dtype=np.float32))
         seen_ids.add(obj_id)
-        inference_state["kf_states"][obj_id] = LightKalman(box)
-        inference_state["kf_pred_box"][obj_id] = box
-        inference_state["last_box"][obj_id] = box
 
     vis_dir = os.path.join("vis_results", os.path.basename(video_path)) if save_vis else None
     if vis_dir:
@@ -72,28 +69,12 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
     # === MAIN PROPAGATION LOOP ===
     with torch.no_grad():
         for rel_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-            # === DEFERRED REMOVAL (executed safely at the start of each frame) ===
-            if "pending_remove" in inference_state and inference_state["pending_remove"]:
-                to_remove = list(inference_state["pending_remove"])
-                for rid in to_remove:
-                    try:
-                        predictor.soft_remove_object(inference_state, rid)
-                        tqdm.write(f"🚫 Soft-removed object {rid} at frame {rel_idx}")
-                    except Exception as e:
-                        tqdm.write(f"[WARN] Failed to remove {rid}: {e}")
-                    # cleanup local records
-                    inference_state["last_seen"].pop(rid, None)
-                    if "seen_ids" in locals() and rid in seen_ids:
-                        seen_ids.remove(rid)
-                inference_state["pending_remove"].clear()
-
             frame_path = os.path.join(video_path, frame_names[rel_idx])
             frame = cv2.imread(frame_path)
 
             # YOLO detect every frame
             results = det_model(frame_path, verbose=False)[0]
 
-            # Get detection results for THIS frame
             boxes_f = results.boxes.xyxy.cpu().numpy()
             scores_f = results.boxes.conf.cpu().numpy()
             classes_f = results.boxes.cls.cpu().numpy()
@@ -131,103 +112,6 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
                 x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
                 existing_boxes.append([x1, y1, x2, y2])
 
-            # === OCCLUSION DETECTION (fix) ===
-            if "last_area" not in inference_state:
-                inference_state["last_area"] = {}
-
-            if "occluded_ids" not in inference_state:
-                inference_state["occluded_ids"] = set()
-
-            occluded_ids = inference_state["occluded_ids"]
-
-            for i, obj_id in enumerate(out_obj_ids):
-                mask = (out_mask_logits_cpu[i] > 0.0).numpy().squeeze()
-                area = mask.sum()
-
-                last_area = inference_state["last_area"].get(obj_id, None)
-
-                # 1) Mask disappeared or extremely small → occlusion
-                if area < 120:  # small-ghost threshold (tune 80–150)
-                    occluded_ids.add(obj_id)
-                    continue
-
-                # 2) mask shrunk too much → occlusion
-                if last_area is not None and area < last_area * 0.2:
-                    occluded_ids.add(obj_id)
-                    continue
-
-                # 3) If KF exists, check consistency with predicted box
-                pred_box = inference_state["kf_pred_box"].get(obj_id, None)
-                if pred_box is not None:
-                    x1, y1, x2, y2 = existing_boxes[i]
-                    sam_box = [x1, y1, x2, y2]
-                    ciou = iou(sam_box, pred_box)
-
-                    if ciou < 0.1:  # KF says object should be here but SAM2 is far
-                        occluded_ids.add(obj_id)
-                        continue
-
-                # Otherwise visible, remove occlusion status
-                if obj_id in occluded_ids:
-                    occluded_ids.remove(obj_id)
-
-                inference_state["last_area"][obj_id] = area
-
-            # === KF UPDATE / PREDICT (light OC-SORT) ===
-            if "kf_states" not in inference_state:
-                inference_state["kf_states"] = {}
-            if "kf_pred_box" not in inference_state:
-                inference_state["kf_pred_box"] = {}
-            if "last_box" not in inference_state:
-                inference_state["last_box"] = {}
-
-            # map obj_id -> box from SAM2 for visible ones
-            visible_box_map = {}
-            for i, obj_id in enumerate(out_obj_ids):
-                if i < len(existing_boxes):
-                    visible_box_map[obj_id] = existing_boxes[i]
-
-            # 1) update KF with current visible boxes
-            for obj_id, box in visible_box_map.items():
-                if obj_id not in inference_state["kf_states"]:
-                    inference_state["kf_states"][obj_id] = LightKalman(box)
-                kf = inference_state["kf_states"][obj_id]
-                pred_box = kf.update(box)
-                inference_state["kf_pred_box"][obj_id] = pred_box
-                inference_state["last_box"][obj_id] = box
-
-            # 2) predict KF for occluded tracks
-            occluded_ids = inference_state.get("occluded_ids", set())
-            for obj_id in occluded_ids:
-                kf = inference_state["kf_states"].get(obj_id, None)
-                if kf is None:
-                    # if never had KF, fall back to last_box
-                    box = inference_state["last_box"].get(obj_id, None)
-                    if box is not None:
-                        inference_state["kf_states"][obj_id] = LightKalman(box)
-                        kf = inference_state["kf_states"][obj_id]
-                    else:
-                        continue
-                pred_box = kf.predict()
-                inference_state["kf_pred_box"][obj_id] = pred_box
-
-                # === VISUALIZE KF PREDICTED BOXES ===
-                kf_vis_dir = f"kf_vis/{os.path.basename(video_path)}"
-                os.makedirs(kf_vis_dir, exist_ok=True)
-
-                kf_frame = frame.copy()
-
-                for obj_id, kf_box in inference_state["kf_pred_box"].items():
-                    x1, y1, x2, y2 = map(int, kf_box)
-                    cv2.rectangle(kf_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # blue KF box
-                    cv2.putText(kf_frame, f'KF {obj_id}', (x1, max(0, y1 - 5)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-                # Save KF visualization image
-                cv2.imwrite(os.path.join(kf_vis_dir, f"{rel_idx:06d}.jpg"), kf_frame)
-
-
-
             # === CLEANUP PHASE ===
             DISAPPEAR_THRESH = 30
             HIGH_IOU_THRESH = 0.9
@@ -242,94 +126,67 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
             for obj_id in out_obj_ids:
                 inference_state["last_seen"][obj_id] = rel_idx
 
-            # 1️⃣ Detect disappeared objects
+            # Detect disappeared objects
             for obj_id, last_f in list(inference_state["last_seen"].items()):
                 if rel_idx - last_f > DISAPPEAR_THRESH:
                     inference_state["pending_remove"].add(obj_id)
 
-
-            # 3️⃣ Defer actual removal until next frame
-            if inference_state["pending_remove"]:
-                tqdm.write(f"[Frame {rel_idx}] Marked for removal: {list(inference_state['pending_remove'])}")
-
-            # === HARD REMOVAL PHASE ===
+            # REMOVAL PHASE
             RETIRE_THRESH = 50  # number of frames since last seen before permanent deletion
-
             if "last_seen" in inference_state:
                 for obj_id, last_f in list(inference_state["last_seen"].items()):
                     if rel_idx - last_f > RETIRE_THRESH:
-                        # Hard-remove only if already soft-removed earlier
-                        if "removed_obj_ids" in inference_state and obj_id in inference_state["removed_obj_ids"]:
-                            try:
-                                predictor.hard_remove_object(inference_state, obj_id)
-                                tqdm.write(f"🧹 Hard-removed object {obj_id} (stale > {RETIRE_THRESH})")
-                            except Exception as e:
-                                tqdm.write(f"[WARN] Hard-remove failed for {obj_id}: {e}")
+                        if not hasattr(predictor, "_pending_hard_remove"):
+                            predictor._pending_hard_remove = set()
+                        predictor._pending_hard_remove.add(obj_id)
 
-            #############################################################
-            # === KF ADDING NEW OBJECTS ===
-            #############################################################
-            new_objects = []
-            occluded_ids = inference_state.get("occluded_ids", set())
+            # Add Module
+            existing_masks_clean = []
+            for i in range(len(out_obj_ids)):
+                mask = (out_mask_logits_cpu[i] > 0.0).numpy().squeeze()
+                mask = clean_mask(mask)
+                existing_masks_clean.append(mask)
 
-            for det_box in cur_boxes:
-                # --- 1) Check if it matches an existing *visible* SAM2 box ---
-                overlaps = [iou(det_box, ebox) for ebox in existing_boxes]
-                matched_visible = (overlaps and max(overlaps) >= 0.3)
+            new_objects = add_new_objects(
+                inference_state=inference_state,
+                cur_boxes=cur_boxes,
+                existing_boxes=existing_boxes,
+                existing_masks=existing_masks_clean,
+                rel_idx=rel_idx,
+                seen_ids=seen_ids,
+                birth_frames=3,  # ensure stable appearance
+                area_ratio_thresh=0.7,  # candidate must be mostly outside SAM masks
+                iou_match_thresh=0.3  # detection is an old object if IoU >= 0.3
+            )
 
-                if matched_visible:
-                    # it already corresponds to a visible SAM2 track; let SAM2 handle it
-                    continue
+            # Add new objects to SAM2
+            if new_objects:
+                inference_state.setdefault("pending_new_objects", [])
+                for new_id, box in new_objects:
+                    tqdm.write(f"🟢 NEW PERSON {new_id} at frame {rel_idx}")
+                    inference_state["pending_new_objects"].append((new_id, box))
 
-                # --- 2) Try to revive an occluded track using KF prediction (light OC-SORT) ---
-                best_id = None
-                best_iou = 0.0
+            # write result
+            current_ids = out_obj_ids
+            valid_ids = set(inference_state["obj_ids"])
 
-                for lost_id in occluded_ids:
-                    kf_box = inference_state["kf_pred_box"].get(lost_id, None)
-                    if kf_box is None:
-                        continue
-                    i = iou(det_box, kf_box)
-                    if i > best_iou:
-                        best_iou = i
-                        best_id = lost_id
+            keep_idx = [i for i, oid in enumerate(current_ids) if oid in valid_ids]
 
-                # OC-SORT-style gating threshold (tune 0.3–0.4 on DanceTrack)
-                if best_id is not None and best_iou > 0.35:
-                    # 🔁 Revive old track instead of creating a new ID
-                    tqdm.write(f"[Frame {rel_idx}] 🔄 Revived occluded ID {best_id} via KF (IoU={best_iou:.2f})")
+            final_ids = [current_ids[i] for i in keep_idx]
+            final_logits = out_mask_logits[keep_idx]
 
-                    # mark as visible again: remove from occluded set
-                    if "occluded_ids" in inference_state and best_id in inference_state["occluded_ids"]:
-                        inference_state["occluded_ids"].remove(best_id)
-                    # update last_seen and last_box
-                    inference_state["last_seen"][best_id] = rel_idx
-                    inference_state["last_box"][best_id] = det_box
-                    # also gently guide SAM2 by adding a box prompt once (optional but helpful)
-                    predictor.add_new_points_or_box(
-                        inference_state=inference_state,
-                        frame_idx=rel_idx,
-                        obj_id=best_id,
-                        box=np.array(det_box, dtype=np.float32),
-                    )
-                    # Don't create a new ID for this det_box
-                    continue
+            assert len(final_ids) == final_logits.shape[0], \
+                f"Mismatch after filtering: {len(final_ids)} vs {final_logits.shape[0]}"
 
-                # --- 3) If no occluded track matches well, create a new one as before ---
-                new_id = max(seen_ids) + 1 if seen_ids else 1
-                tqdm.write(f"🟢 Queuing new object {new_id} at frame {rel_idx}")
+            for idx, tid in enumerate(final_ids):
+                mask = (final_logits[idx] > 0).cpu().numpy().squeeze()
+                y, x = np.where(mask)
+                if len(x) == 0: continue
+                x1, y1, x2, y2 = min(x), min(y), max(x), max(y)
+                w, h = x2 - x1, y2 - y1
+                writer.write(f"{rel_idx + 1},{tid},{x1},{y1},{w},{h},1,-1,-1,-1\n")
 
-                if "pending_new_objects" not in inference_state:
-                    inference_state["pending_new_objects"] = []
-                inference_state["pending_new_objects"].append((new_id, det_box))
-                new_objects.append(new_id)
-                seen_ids.add(new_id)
-
-                # init KF for the new ID as well
-                inference_state["kf_states"][new_id] = LightKalman(det_box)
-                inference_state["kf_pred_box"][new_id] = det_box
-                inference_state["last_box"][new_id] = det_box
-
+            '''
             # --- Write results ---
             for i, out_obj_id in enumerate(out_obj_ids):
                 mask = (out_mask_logits_cpu[i] > 0.0).numpy().squeeze(0)
@@ -340,17 +197,21 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
                 w, h = x2 - x1, y2 - y1
                 line = f"{rel_idx+1},{out_obj_id},{x1},{y1},{w},{h},1,-1,-1,-1\n"
                 writer.write(line)
+            '''
 
-            # --- Save visualization frame  ---
+            # --- Save visualization frame only (no display) ---
             if save_vis:
                 save_path = os.path.join(vis_dir, f"{rel_idx:06d}.jpg")
-                visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors,
+                visualize_tracking(frame, final_ids, final_logits, id_colors,
                                    save_path=save_path)
+                #visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors,
+                                   #save_path=save_path)
 
             torch.cuda.empty_cache()
 
     del inference_state
     torch.cuda.empty_cache()
+
 
 
 def main():
@@ -361,7 +222,7 @@ def main():
         if not os.path.isdir(img_dir):
             continue
         #test_list = sorted(os.listdir(split_dir))[11]
-        test_list = sorted(os.listdir(split_dir))[0]
+        test_list = sorted(os.listdir(split_dir))[1]
         if seq not in test_list:
             continue
 
@@ -414,16 +275,15 @@ def main():
 
 if __name__ == "__main__":
     device = torch.device("cuda")
-    SHOW_SCORE = False  # or False to disable all quality/occlusion visualization
 
     # checkpoints
     sam2_checkpoint = "checkpoints/sam2.1_hiera_tiny.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-    det_model = YOLO('checkpoints/yolov8x-pose.pt')
+    det_model = YOLO('checkpoints/yolov8x-pose-p6.pt')
 
     # DanceTrack root
     dancetrack_root = "/home/seraco/Project/data/MOT/dancetrack"
-    split = "exp"  # change to "train" or "test" as needed
+    split = "test"  # change to "train" or "test" as needed
     split_dir = os.path.join(dancetrack_root, split)
 
     MAX_DIRECT = 1300  # threshold for direct processing

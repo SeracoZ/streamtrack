@@ -12,7 +12,8 @@ from sam2.build_sam import build_sam2_video_predictor
 from ultralytics import YOLO
 
 from filter import clean_mask
-from vis import draw_score_on_frame, visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
+from add import add_new_objects
+from vis import visualize_tracking, is_full_body, adjust_box_to_pose
 
 
 def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=True, quiet=False):
@@ -36,7 +37,7 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
 
     bboxes = []
     for i in range(len(boxes)):
-        if int(classes[i]) != 0 or scores[i] < 0.4:
+        if int(classes[i]) != 0 or scores[i] < 0.2:
             continue
         if not is_full_body(kpts_conf[i]):
             continue
@@ -48,8 +49,6 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
             conf_thresh=0.3
         )
         bboxes.append(new_box)
-
-    bboxes = filter_overlapping_bboxes(bboxes, contain_thresh=0.9)
 
     if not bboxes:
         print("⚠️ No person detected, skipping...")
@@ -97,7 +96,7 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
                 )
                 cur_boxes.append(new_box)
 
-            cur_boxes = filter_overlapping_bboxes(cur_boxes, contain_thresh=0.9)
+            #cur_boxes = filter_overlapping_bboxes(cur_boxes, contain_thresh=0.9)
 
             # compute existing boxes from masks
             out_mask_logits_cpu = out_mask_logits.detach().cpu()
@@ -113,7 +112,6 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
 
             # === CLEANUP PHASE ===
             DISAPPEAR_THRESH = 30
-            HIGH_IOU_THRESH = 0.9
 
             # Initialize helper dicts
             if "last_seen" not in inference_state:
@@ -131,68 +129,41 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
                     inference_state["pending_remove"].add(obj_id)
 
 
-            # 3Defer actual removal until next frame
-            if inference_state["pending_remove"]:
-                tqdm.write(f"[Frame {rel_idx}] Marked for removal: {list(inference_state['pending_remove'])}")
-
-            # === HARD REMOVAL PHASE ===
+            # REMOVAL PHASE
             RETIRE_THRESH = 50  # number of frames since last seen before permanent deletion
-
             if "last_seen" in inference_state:
                 for obj_id, last_f in list(inference_state["last_seen"].items()):
                     if rel_idx - last_f > RETIRE_THRESH:
-                        if "removed_obj_ids" in inference_state and obj_id in inference_state["removed_obj_ids"]:
-                            predictor.hard_remove_object(inference_state, obj_id)
-                            tqdm.write(f"🧹 Hard-removed object {obj_id} (stale > {RETIRE_THRESH})")
+                        if not hasattr(predictor, "_pending_hard_remove"):
+                            predictor._pending_hard_remove = set()
+                        predictor._pending_hard_remove.add(obj_id)
 
+            # Add Module
+            existing_masks_clean = []
+            for i in range(len(out_obj_ids)):
+                mask = (out_mask_logits_cpu[i] > 0.0).numpy().squeeze()
+                mask = clean_mask(mask)
+                existing_masks_clean.append(mask)
 
-            # STRICT 3-FRAME CONFIRMATION FOR ADDING NEW OBJECTS
-            candidates = inference_state["candidate_new"]
-            confirmed_ids = []
+            new_objects = add_new_objects(
+                inference_state=inference_state,
+                cur_boxes=cur_boxes,
+                existing_boxes=existing_boxes,
+                existing_masks=existing_masks_clean,
+                rel_idx=rel_idx,
+                seen_ids=seen_ids,
+                birth_frames=3,  # ensure stable appearance
+                area_ratio_thresh=0.7,  # candidate must be mostly outside SAM masks
+                iou_match_thresh=0.3  # detection is an old object if IoU >= 0.3
+            )
 
-            for det_box in cur_boxes:
-                overlaps = [iou(det_box, ebox) for ebox in existing_boxes]
-                if overlaps and max(overlaps) >= 0.3:
-                    continue
+            # Add new objects to SAM2
+            if new_objects:
+                inference_state.setdefault("pending_new_objects", [])
+                for new_id, box in new_objects:
+                    tqdm.write(f"🟢 NEW PERSON {new_id} at frame {rel_idx}")
+                    inference_state["pending_new_objects"].append((new_id, box))
 
-                matched_cid = None
-                for cid, info in candidates.items():
-                    if iou(det_box, info["box"]) > 0.3:
-                        matched_cid = cid
-                        break
-
-                if matched_cid is None:
-                    cid = len(candidates) + 1
-                    candidates[cid] = {
-                        "box": det_box,
-                        "hit": 1,
-                        "last_frame": rel_idx,
-                    }
-                else:
-                    candidates[matched_cid]["hit"] += 1
-                    candidates[matched_cid]["box"] = det_box
-                    candidates[matched_cid]["last_frame"] = rel_idx
-
-                    if candidates[matched_cid]["hit"] >= 3:
-                        new_id = max(seen_ids) + 1 if seen_ids else 1
-                        tqdm.write(f"🟢 CONFIRMED new person {new_id} at frame {rel_idx}")
-
-                        inference_state.setdefault("pending_new_objects", [])
-                        inference_state["pending_new_objects"].append((new_id, det_box))
-                        seen_ids.add(new_id)
-                        confirmed_ids.append(matched_cid)
-
-            for cid in confirmed_ids:
-                if cid in candidates:
-                    del candidates[cid]
-
-            # Remove stale candidates that disappear for > 1 frame
-            stale = []
-            for cid, info in candidates.items():
-                if rel_idx - info["last_frame"] > 1:  # candidate disappeared
-                    stale.append(cid)
-            for cid in stale:
-                del candidates[cid]
 
             # write result
             current_ids = out_obj_ids
@@ -250,9 +221,9 @@ def main():
         if not os.path.isdir(img_dir):
             continue
 
-        test_list = sorted(os.listdir(split_dir))[20]
-        if seq not in test_list:
-            continue
+        #test_list = sorted(os.listdir(split_dir))[20]
+        #if seq not in test_list:
+            #continue
 
         print(f"\n=== Processing sequence: {seq} ===")
         frame_names = sorted(
@@ -323,7 +294,7 @@ if __name__ == "__main__":
     # checkpoints
     sam2_checkpoint = "checkpoints/sam2.1_hiera_tiny.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-    det_model = YOLO('checkpoints/yolov8x-pose.pt')
+    det_model = YOLO('checkpoints/yolov8x-pose-p6.pt')
 
     # DanceTrack root
     dancetrack_root = "/home/seraco/Project/data/MOT/dancetrack"

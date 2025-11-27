@@ -588,13 +588,7 @@ class SAM2VideoPredictor(SAM2Base):
         for frame_idx in tqdm(processing_order, desc="propagate in video"):
             pred_masks_per_obj = [None] * batch_size
 
-            ###########################################################
             import torch
-
-            if frame_idx % 5 == 0:
-                mem_alloc = torch.cuda.memory_allocated() / 1e9
-                mem_resvd = torch.cuda.memory_reserved() / 1e9
-                print(f"[Frame {frame_idx}] GPU allocated: {mem_alloc:.2f} GB, reserved: {mem_resvd:.2f} GB")
 
             if frame_idx % 50 == 0:
                 torch.cuda.empty_cache()
@@ -605,16 +599,13 @@ class SAM2VideoPredictor(SAM2Base):
                             out["maskmem_pos_enc"] = [x.cpu() for x in out["maskmem_pos_enc"]]
 
 
-            if frame_idx == 36:
-                print('Time to debug')
-
             # --- DYNAMIC NEW OBJECT ADDITION ---
             if "pending_new_objects" in inference_state and inference_state["pending_new_objects"]:
                 pending_list = inference_state["pending_new_objects"]
-                print(f"[Frame {frame_idx}] Processing {len(pending_list)} pending new objects...")
+                #print(f"[Frame {frame_idx}] Processing {len(pending_list)} pending new objects...")
 
                 for obj_id, det_box in pending_list:
-                    print(f"   → adding ID {obj_id}")
+                    #print(f"   → adding ID {obj_id}")
                     _, _, _ = self.add_new_points_or_box(
                         inference_state=inference_state,
                         frame_idx=frame_idx,
@@ -661,7 +652,6 @@ class SAM2VideoPredictor(SAM2Base):
 
             # Collect active objects
             active_obj_indices = []
-            #for obj_idx in range(batch_size):
             for obj_idx in list(inference_state["obj_idx_to_id"].keys()):
                 obj_id = inference_state["obj_idx_to_id"][obj_idx]
 
@@ -694,7 +684,7 @@ class SAM2VideoPredictor(SAM2Base):
             # Prepare per-object conditioning dicts for batch
             if len(active_obj_indices) > 0:
                 # Run SAM2 inference once per active object
-                t_track_start = time.time() # debug time consume
+                #t_track_start = time.time() # debug time consume
                 current_out_all, pred_masks_all = [], []
 
                 for obj_idx in active_obj_indices:
@@ -713,9 +703,9 @@ class SAM2VideoPredictor(SAM2Base):
                     current_out_all.append(current_out)
                     pred_masks_all.append(pred_masks)
 
-                t_track_end = time.time()
-                inference_state["last_frame_track_time"] = t_track_end - t_track_start
-                print(f'inference time:{t_track_end - t_track_start}')
+                #t_track_end = time.time()
+                #inference_state["last_frame_track_time"] = t_track_end - t_track_start
+                #print(f'inference time:{t_track_end - t_track_start}')
 
                 for local_idx, obj_idx in enumerate(active_obj_indices):
                     obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
@@ -807,21 +797,26 @@ class SAM2VideoPredictor(SAM2Base):
             )
 
 
-            self.remove_totally_overlapping_masks(
+            self.remove_overlapping_masks(
                 inference_state,
-                contain_thresh=0.95,
-                debug=False,
-                current_masks=video_res_masks,  # <- use current frame masks
-                current_obj_ids=obj_ids,  # <- use current frame ids
+                iou_thresh=0.90,
+                current_masks=video_res_masks,
+                current_obj_ids=obj_ids,
             )
 
-
-            # Handle deferred full removals using remove_object() ===
+            # === Handle deferred HARD removals ===
             if hasattr(self, "_pending_hard_remove") and self._pending_hard_remove:
                 to_remove = list(self._pending_hard_remove)
-                print(f"\n[Frame {frame_idx}] Removing overlapped objects via remove_object(): {to_remove}")
+                print(f"\n[Frame {frame_idx}] HARD removing objects: {to_remove}")
+
                 for rid in to_remove:
-                    self.remove_object(inference_state, rid, strict=False, need_output=False)
+                    try:
+                        # full strict removal → reindexing → safest version
+                        self.remove_object(inference_state, rid, strict=False, need_output=False)
+                        inference_state["last_seen"].pop(rid, None)
+                        inference_state.get("occluded_ids", set()).discard(rid)
+                    except Exception as e:
+                        print(f"[HARD REMOVE ERROR] Could not remove {rid}: {e}")
 
                 self._pending_hard_remove.clear()
 
@@ -1149,81 +1144,45 @@ class SAM2VideoPredictor(SAM2Base):
         print(f"✅ Dynamically added object {obj_id} at frame {frame_idx}")
         return inference_state
 
-
     @torch.inference_mode()
-    def remove_totally_overlapping_masks(
+    def remove_overlapping_masks(
             self,
             inference_state,
-            contain_thresh: float = 0.95,
+            iou_thresh: float = 0.90,
             debug: bool = False,
-            current_masks: torch.Tensor | None = None,  # [N,1,H,W] logits at video res (this frame)
+            current_masks: torch.Tensor | None = None,  # [N,1,H,W]
             current_obj_ids: list[int] | None = None,
     ):
         """
-        Detect totally overlapping masks and MARK the smaller one for hard removal.
-        Actual removal is deferred to the end of the frame (in propagate_in_video).
-        If `current_masks` and `current_obj_ids` are provided, operate on those for this frame.
-        Otherwise, fall back to the most recent masks cached in `inference_state`.
+        Remove masks that are ≥90% similar (IoU ≥ iou_thresh).
+        This catches masks that overlap in both shape and position.
         """
-        # ---- get binary masks + ids ----
-        bin_masks = None
-        obj_ids = None
-
-        if current_masks is not None and current_obj_ids is not None and len(current_obj_ids) > 1:
-            # use current frame’s masks
-            with torch.no_grad():
-                bin_masks = (current_masks.detach().to("cpu") > 0).numpy().squeeze(1)  # [N,H,W]
-            obj_ids = list(current_obj_ids)
-        else:
-            # fallback to latest masks in state (older behavior)
-            if "output_dict_per_obj" not in inference_state or len(inference_state["output_dict_per_obj"]) <= 1:
-                return inference_state
-            obj_ids = list(inference_state["obj_id_to_idx"].keys())
-            masks_np = []
-            valid_ids = []
-            for oid in obj_ids:
-                oidx = inference_state["obj_id_to_idx"][oid]
-                o = inference_state["output_dict_per_obj"].get(oidx, {})
-                nonc = o.get("non_cond_frame_outputs", {})
-                cond = o.get("cond_frame_outputs", {})
-                if len(nonc) > 0:
-                    t = max(nonc.keys());
-                    m = nonc[t]["pred_masks"]
-                elif len(cond) > 0:
-                    t = max(cond.keys());
-                    m = cond[t]["pred_masks"]
-                else:
-                    continue
-                masks_np.append((m.detach().cpu().numpy() > 0).astype(np.uint8).squeeze())
-                valid_ids.append(oid)
-            if len(masks_np) <= 1:
-                return inference_state
-            bin_masks = np.stack(masks_np, 0)
-            obj_ids = valid_ids
-
-        if bin_masks is None or len(obj_ids) <= 1:
+        if current_masks is None or current_obj_ids is None or len(current_obj_ids) <= 1:
             return inference_state
 
-        # ---- compare pairwise containment ----
-        areas = [m.sum() for m in bin_masks]
-        marked = set()
+        masks = (current_masks > 0).float().squeeze(1)  # [N,H,W]
+        obj_ids = list(current_obj_ids)
         N = len(obj_ids)
+
+        areas = masks.sum(dim=[1, 2])  # [N]
+        marked = set()
+
+
         for i in range(N):
-            if areas[i] == 0:
+            if areas[i] < 5:
                 continue
             for j in range(i + 1, N):
-                if areas[j] == 0:
+                if areas[j] < 5:
                     continue
-                inter = np.logical_and(bin_masks[i], bin_masks[j]).sum()
-                smaller = min(areas[i], areas[j])
-                contain = inter / smaller if smaller > 0 else 0.0
-                if contain >= contain_thresh:
-                    smaller_id = obj_ids[j] if areas[i] >= areas[j] else obj_ids[i]
-                    marked.add(smaller_id)
-                    if debug:
-                        print(f"[MaskOverlap] mark hard-remove ID {smaller_id} (contain={contain:.3f})")
+                inter = (masks[i] * masks[j]).sum()
+                union = areas[i] + areas[j] - inter
+                if union <= 0:
+                    continue
+                iou = (inter / union).item()
+                if iou >= iou_thresh:
+                    remove_id = obj_ids[j] if areas[i] >= areas[j] else obj_ids[i]
+                    marked.add(remove_id)
 
-        # ---- stash for deferred hard removal ----
         if not hasattr(self, "_pending_hard_remove"):
             self._pending_hard_remove = set()
         self._pending_hard_remove.update(marked)

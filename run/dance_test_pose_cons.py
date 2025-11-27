@@ -12,7 +12,7 @@ from sam2.build_sam import build_sam2_video_predictor
 from ultralytics import YOLO
 
 from filter import clean_mask
-from vis import draw_score_on_frame, visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
+from vis import visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
 
 
 def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quiet=False):
@@ -311,7 +311,7 @@ if __name__ == "__main__":
 
     # DanceTrack root
     dancetrack_root = "/home/seraco/Project/data/MOT/dancetrack"
-    split = "exp"  # change to "train" or "test" as needed
+    split = "test"  # change to "train" or "test" as needed
     split_dir = os.path.join(dancetrack_root, split)
 
     MAX_DIRECT = 1300  # threshold for direct processing
