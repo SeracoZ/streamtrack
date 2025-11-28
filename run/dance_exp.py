@@ -12,10 +12,11 @@ from sam2.build_sam import build_sam2_video_predictor
 from ultralytics import YOLO
 
 from filter import clean_mask
-from vis import draw_score_on_frame, visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
+from add import add_new_objects
+from vis import visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
 
 
-def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=True, quiet=False):
+def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quiet=False):
     """Run SAM2+YOLO tracking with tqdm progress and frame saving only."""
     inference_state = predictor.init_state(video_path=video_path)
     predictor.reset_state(inference_state)
@@ -36,7 +37,7 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
 
     bboxes = []
     for i in range(len(boxes)):
-        if int(classes[i]) != 0 or scores[i] < 0.4:
+        if int(classes[i]) != 0 or scores[i] < 0.2:
             continue
         if not is_full_body(kpts_conf[i]):
             continue
@@ -49,7 +50,7 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
         )
         bboxes.append(new_box)
 
-    bboxes = filter_overlapping_bboxes(bboxes, contain_thresh=0.9)
+    #bboxes = filter_overlapping_bboxes(bboxes, contain_thresh=0.9)
 
     if not bboxes:
         print("⚠️ No person detected, skipping...")
@@ -130,69 +131,40 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
                 if rel_idx - last_f > DISAPPEAR_THRESH:
                     inference_state["pending_remove"].add(obj_id)
 
-
-            # 3Defer actual removal until next frame
-            if inference_state["pending_remove"]:
-                tqdm.write(f"[Frame {rel_idx}] Marked for removal: {list(inference_state['pending_remove'])}")
-
-            # === HARD REMOVAL PHASE ===
+            # REMOVAL PHASE
             RETIRE_THRESH = 50  # number of frames since last seen before permanent deletion
-
             if "last_seen" in inference_state:
                 for obj_id, last_f in list(inference_state["last_seen"].items()):
                     if rel_idx - last_f > RETIRE_THRESH:
-                        if "removed_obj_ids" in inference_state and obj_id in inference_state["removed_obj_ids"]:
-                            predictor.hard_remove_object(inference_state, obj_id)
-                            tqdm.write(f"🧹 Hard-removed object {obj_id} (stale > {RETIRE_THRESH})")
+                        if not hasattr(predictor, "_pending_hard_remove"):
+                            predictor._pending_hard_remove = set()
+                        predictor._pending_hard_remove.add(obj_id)
 
+            # Add Module
+            existing_masks_clean = []
+            for i in range(len(out_obj_ids)):
+                mask = (out_mask_logits_cpu[i] > 0.0).numpy().squeeze()
+                mask = clean_mask(mask)
+                existing_masks_clean.append(mask)
 
-            # STRICT 3-FRAME CONFIRMATION FOR ADDING NEW OBJECTS
-            candidates = inference_state["candidate_new"]
-            confirmed_ids = []
+            new_objects = add_new_objects(
+                inference_state=inference_state,
+                cur_boxes=cur_boxes,
+                existing_boxes=existing_boxes,
+                existing_masks=existing_masks_clean,
+                rel_idx=rel_idx,
+                seen_ids=seen_ids,
+                birth_frames=3,  # ensure stable appearance
+                area_ratio_thresh=0.7,  # candidate must be mostly outside SAM masks
+                iou_match_thresh=0.3  # detection is an old object if IoU >= 0.3
+            )
 
-            for det_box in cur_boxes:
-                overlaps = [iou(det_box, ebox) for ebox in existing_boxes]
-                if overlaps and max(overlaps) >= 0.3:
-                    continue
-
-                matched_cid = None
-                for cid, info in candidates.items():
-                    if iou(det_box, info["box"]) > 0.3:
-                        matched_cid = cid
-                        break
-
-                if matched_cid is None:
-                    cid = len(candidates) + 1
-                    candidates[cid] = {
-                        "box": det_box,
-                        "hit": 1,
-                        "last_frame": rel_idx,
-                    }
-                else:
-                    candidates[matched_cid]["hit"] += 1
-                    candidates[matched_cid]["box"] = det_box
-                    candidates[matched_cid]["last_frame"] = rel_idx
-
-                    if candidates[matched_cid]["hit"] >= 3:
-                        new_id = max(seen_ids) + 1 if seen_ids else 1
-                        tqdm.write(f"🟢 CONFIRMED new person {new_id} at frame {rel_idx}")
-
-                        inference_state.setdefault("pending_new_objects", [])
-                        inference_state["pending_new_objects"].append((new_id, det_box))
-                        seen_ids.add(new_id)
-                        confirmed_ids.append(matched_cid)
-
-            for cid in confirmed_ids:
-                if cid in candidates:
-                    del candidates[cid]
-
-            # Remove stale candidates that disappear for > 1 frame
-            stale = []
-            for cid, info in candidates.items():
-                if rel_idx - info["last_frame"] > 1:  # candidate disappeared
-                    stale.append(cid)
-            for cid in stale:
-                del candidates[cid]
+            # Add new objects to SAM2
+            if new_objects:
+                inference_state.setdefault("pending_new_objects", [])
+                for new_id, box in new_objects:
+                    tqdm.write(f"🟢 NEW PERSON {new_id} at frame {rel_idx}")
+                    inference_state["pending_new_objects"].append((new_id, box))
 
             # write result
             current_ids = out_obj_ids
@@ -212,7 +184,7 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
                 if len(x) == 0: continue
                 x1, y1, x2, y2 = min(x), min(y), max(x), max(y)
                 w, h = x2 - x1, y2 - y1
-                writer.write(f"{rel_idx + 1 + offset},{tid},{x1},{y1},{w},{h},1,-1,-1,-1\n")
+                writer.write(f"{rel_idx + 1},{tid},{x1},{y1},{w},{h},1,-1,-1,-1\n")
 
             '''
             # --- Write results ---
@@ -229,7 +201,7 @@ def run_sequence(predictor, video_path, frame_names, writer, offset=0, save_vis=
 
             # --- Save visualization frame only (no display) ---
             if save_vis:
-                save_path = os.path.join(vis_dir, f"{rel_idx+offset:06d}.jpg")
+                save_path = os.path.join(vis_dir, f"{rel_idx:06d}.jpg")
                 visualize_tracking(frame, final_ids, final_logits, id_colors,
                                    save_path=save_path)
                 #visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors,
@@ -249,8 +221,8 @@ def main():
         img_dir = os.path.join(split_dir, seq, "img1")
         if not os.path.isdir(img_dir):
             continue
-
-        test_list = sorted(os.listdir(split_dir))[7]
+        #test_list = sorted(os.listdir(split_dir))[11]
+        test_list = sorted(os.listdir(split_dir))[1]
         if seq not in test_list:
             continue
 
@@ -270,15 +242,7 @@ def main():
             # Direct mode
             if num_frames <= MAX_DIRECT:
                 print(f" → Direct processing ({num_frames} frames)")
-                run_sequence(
-                    predictor,
-                    img_dir,
-                    frame_names,
-                    writer=f,
-                    offset=0,
-                    save_vis=True,
-                    quiet=False
-                )
+                run_sequence(predictor, img_dir, frame_names, writer=f, save_vis=True, quiet=False)
 
             # Sliding mode
             else:
@@ -293,37 +257,29 @@ def main():
                           f"(frames {frame_idx+1}-{min(frame_idx+SLIDE_SIZE, num_frames)})")
 
                     # prepare tmp dir
-                    tmp_dir = os.path.join(TMP_DIR, f"{seq}_slice_{slice_idx}")
-                    if os.path.exists(tmp_dir):
-                        shutil.rmtree(tmp_dir)
-                    os.makedirs(tmp_dir, exist_ok=True)
+                    if os.path.exists(TMP_DIR):
+                        shutil.rmtree(TMP_DIR)
+                    os.makedirs(TMP_DIR, exist_ok=True)
 
                     for fn in slice_frames:
                         os.symlink(os.path.join(img_dir, fn),
-                                   os.path.join(tmp_dir, fn))
+                                   os.path.join(TMP_DIR, fn))
 
-                    run_sequence(
-                        predictor,
-                        tmp_dir,
-                        slice_frames,
-                        offset=frame_idx,
-                        writer=f,
-                        save_vis=False,
-                        quiet=False
-                    )
+                    run_sequence(predictor, TMP_DIR, slice_frames, offset=frame_idx, writer=f)
 
-                    shutil.rmtree(tmp_dir)
+                    shutil.rmtree(TMP_DIR)
                     frame_idx += SLIDE_SIZE
                     slice_idx += 1
 
         print(f"Saved results to {out_file}")
+
 if __name__ == "__main__":
     device = torch.device("cuda")
 
     # checkpoints
     sam2_checkpoint = "checkpoints/sam2.1_hiera_tiny.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
-    det_model = YOLO('checkpoints/yolov8x-pose.pt')
+    det_model = YOLO('checkpoints/yolov8x-pose-p6.pt')
 
     # DanceTrack root
     dancetrack_root = "/home/seraco/Project/data/MOT/dancetrack"

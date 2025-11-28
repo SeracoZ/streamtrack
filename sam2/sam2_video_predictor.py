@@ -17,6 +17,8 @@ import numpy as np
 from sam2.modeling.sam2_base import NO_OBJ_SCORE, SAM2Base
 from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video_frames
 
+from .memory_controller import ConsistencyVerifier
+
 
 class SAM2VideoPredictor(SAM2Base):
     """The predictor class to handle user interactions and manage inference states."""
@@ -39,6 +41,7 @@ class SAM2VideoPredictor(SAM2Base):
         self.non_overlap_masks = non_overlap_masks
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.add_all_frames_to_correct_as_cond = add_all_frames_to_correct_as_cond
+        self.consistency = ConsistencyVerifier()
 
     @torch.inference_mode()
     def init_state(
@@ -585,13 +588,7 @@ class SAM2VideoPredictor(SAM2Base):
         for frame_idx in tqdm(processing_order, desc="propagate in video"):
             pred_masks_per_obj = [None] * batch_size
 
-            ###########################################################
             import torch
-
-            if frame_idx % 5 == 0:
-                mem_alloc = torch.cuda.memory_allocated() / 1e9
-                mem_resvd = torch.cuda.memory_reserved() / 1e9
-                print(f"[Frame {frame_idx}] GPU allocated: {mem_alloc:.2f} GB, reserved: {mem_resvd:.2f} GB")
 
             if frame_idx % 50 == 0:
                 torch.cuda.empty_cache()
@@ -605,25 +602,10 @@ class SAM2VideoPredictor(SAM2Base):
             # --- DYNAMIC NEW OBJECT ADDITION ---
             if "pending_new_objects" in inference_state and inference_state["pending_new_objects"]:
                 pending_list = inference_state["pending_new_objects"]
-                print(f"[Frame {frame_idx}] Processing {len(pending_list)} pending new objects...")
-
-                # 1️⃣ Extract current frame image and features
-                image_tensor = inference_state["images"][frame_idx].unsqueeze(0).to(self.device)
-                backbone_out = self.forward_image(image_tensor)
-                #vision_feats, vision_pos_embeds, feat_sizes = self._prepare_backbone_features(backbone_out)
-                vision_feats, vision_pos_embeds, feat_sizes, vision_input = self._prepare_backbone_features(
-                    backbone_out)
-
-                # Shared features for all new objects
-                cached_feats = {
-                    "vision_feats": vision_feats,
-                    "vision_pos_embeds": vision_pos_embeds,
-                    "feat_sizes": feat_sizes,
-                }
+                #print(f"[Frame {frame_idx}] Processing {len(pending_list)} pending new objects...")
 
                 for obj_id, det_box in pending_list:
-                    print(f"   → adding ID {obj_id}")
-                    # (A) add box prompt
+                    #print(f"   → adding ID {obj_id}")
                     _, _, _ = self.add_new_points_or_box(
                         inference_state=inference_state,
                         frame_idx=frame_idx,
@@ -633,7 +615,6 @@ class SAM2VideoPredictor(SAM2Base):
                         normalize_coords=True,
                     )
 
-                    # (B) encode into memory immediately (partial preflight)
                     obj_idx = self._obj_id_to_idx(inference_state, obj_id)
                     out_tmp = inference_state["temp_output_dict_per_obj"][obj_idx]["cond_frame_outputs"].get(frame_idx)
                     if out_tmp is None:
@@ -666,20 +647,14 @@ class SAM2VideoPredictor(SAM2Base):
 
                 print(f"[Frame {frame_idx}] Now tracking {batch_size} objects: {obj_ids}")
 
-
-            ###########################################################
             removed_ids = inference_state.get("removed_obj_ids", set())
             device = inference_state["device"]
 
-            # -------------------------------------------------------------
-            # 1️⃣ Collect active objects for batched inference
-            # -------------------------------------------------------------
+            # Collect active objects
             active_obj_indices = []
-            #for obj_idx in range(batch_size):
             for obj_idx in list(inference_state["obj_idx_to_id"].keys()):
                 obj_id = inference_state["obj_idx_to_id"][obj_idx]
 
-                # Skip removed objects
                 if obj_id in removed_ids:
                     pred_masks_per_obj[obj_idx] = torch.full(
                         (1, 1, self.image_size // 4, self.image_size // 4),
@@ -688,15 +663,6 @@ class SAM2VideoPredictor(SAM2Base):
                         device=device,
                     )
                     continue
-
-                if obj_idx not in inference_state["output_dict_per_obj"]:
-                    print(f"[debug-loop] ❌ Missing obj_idx {obj_idx}")
-                    print(
-                        f"[debug-loop] Existing output_dict_per_obj keys: {list(inference_state['output_dict_per_obj'].keys())}")
-                    print(f"[debug-loop] Current obj_idx_to_id: {inference_state.get('obj_idx_to_id')}")
-                    print(f"[debug-loop] Current obj_id_to_idx: {inference_state.get('obj_id_to_idx')}")
-                    print(f"[debug-loop] Current obj_ids: {inference_state.get('obj_ids')}")
-                    raise KeyError(f"obj_idx {obj_idx} not found in output_dict_per_obj")
 
                 obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
 
@@ -714,32 +680,20 @@ class SAM2VideoPredictor(SAM2Base):
                 # all other frames go into batched inference
                 active_obj_indices.append(obj_idx)
 
-            # -------------------------------------------------------------
-            # 2️⃣ Prepare per-object conditioning dicts for batch
-            # -------------------------------------------------------------
-            if len(active_obj_indices) > 0:
-                batched_output_dicts = [
-                    {
-                        # keep each object's original conditioning frames (usually only frame 0)
-                        "cond_frame_outputs": inference_state["output_dict_per_obj"][i]["cond_frame_outputs"],
-                        "non_cond_frame_outputs": {},
-                    }
-                    for i in active_obj_indices
-                ]
 
-                # -------------------------------------------------------------
-                # 3️⃣ Run SAM2 inference once per active object (semi-batched)
-                t_track_start = time.time()
+            # Prepare per-object conditioning dicts for batch
+            if len(active_obj_indices) > 0:
+                # Run SAM2 inference once per active object
+                #t_track_start = time.time() # debug time consume
                 current_out_all, pred_masks_all = [], []
 
                 for obj_idx in active_obj_indices:
                     obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-
                     current_out, pred_masks = self._run_single_frame_inference(
                         inference_state=inference_state,
-                        output_dict=obj_output_dict,  # 👈 single dict (as SAM2 expects)
+                        output_dict=obj_output_dict,
                         frame_idx=frame_idx,
-                        batch_size=1,  # 👈 one object at a time
+                        batch_size=1,
                         is_init_cond_frame=False,
                         point_inputs=None,
                         mask_inputs=None,
@@ -749,15 +703,10 @@ class SAM2VideoPredictor(SAM2Base):
                     current_out_all.append(current_out)
                     pred_masks_all.append(pred_masks)
 
-                t_track_end = time.time()
-                inference_state["last_frame_track_time"] = t_track_end - t_track_start
-                print(f'inference time:{t_track_end - t_track_start}')
+                #t_track_end = time.time()
+                #inference_state["last_frame_track_time"] = t_track_end - t_track_start
+                #print(f'inference time:{t_track_end - t_track_start}')
 
-
-                # -------------------------------------------------------------
-                # 4️⃣ Distribute batched outputs back to each object
-                # -------------------------------------------------------------
-                # combine outputs
                 for local_idx, obj_idx in enumerate(active_obj_indices):
                     obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
                     storage_key = "non_cond_frame_outputs"
@@ -772,6 +721,63 @@ class SAM2VideoPredictor(SAM2Base):
                     if len(nc) > 12:
                         for old_k in sorted(list(nc.keys()))[:-12]:
                             del nc[old_k]
+
+                '''
+                # Distribute batched outputs back to each object
+                for local_idx, obj_idx in enumerate(active_obj_indices):
+                    obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
+                    storage_key = "non_cond_frame_outputs"
+
+                    current_out = current_out_all[local_idx]
+                    pred_masks = pred_masks_all[local_idx]
+
+                    # Consistency Verification Step
+                    mask_np = (pred_masks[0] > 0).detach().cpu().numpy()
+                    obj_ptr = current_out["obj_ptr"]
+                    score_logit = current_out["object_score_logits"]
+                    track_id = inference_state["obj_idx_to_id"][obj_idx]
+                    mask_np = mask_np.squeeze()
+                    # analyze
+                    result = self.consistency.analyze(
+                        track_id=track_id,
+                        obj_ptr=obj_ptr,
+                        score_logit=score_logit,
+                        mask_np=mask_np,
+                    )
+
+                    # occlusion → stop memory update
+                    if result["is_occluded"]:
+                        if "occluded_ids" not in inference_state:
+                            inference_state["occluded_ids"] = set()
+                        inference_state["occluded_ids"].add(track_id)
+                        print(f"[Verifier] Occlusion detected for ID {track_id}, skip memory update")
+                        continue  # 🚫 Do NOT save into memory! Skip pruning too.
+
+                    # ID correction
+                    correct_id = result["correct_id"]
+                    if correct_id != track_id:
+                        print(f"[Verifier] ID switch fixed: {track_id} → {correct_id}")
+                        obj_idx = inference_state["obj_id_to_idx"][correct_id]
+                        track_id = correct_id
+
+                    obj_output_dict[storage_key][frame_idx] = current_out
+                    pred_masks_per_obj[obj_idx] = pred_masks_all[local_idx]
+                    inference_state["frames_tracked_per_obj"][obj_idx][frame_idx] = {"reverse": reverse}
+
+                    # ---- prune non-cond memory ----
+                    nc = obj_output_dict.get("non_cond_frame_outputs", {})
+                    if len(nc) > 12:
+                        for old_k in sorted(list(nc.keys()))[:-12]:
+                            del nc[old_k]
+
+                    # update previous-frame memory for verifier
+                    self.consistency.update_prev(
+                        track_id=track_id,
+                        obj_ptr=obj_ptr,
+                        mask_np=mask_np,
+                        score_logit=score_logit
+                    )
+            '''
 
             # Resize the output mask to the original video resolution (we directly use
             # the mask scores on GPU for output to avoid any CPU conversion in between)
@@ -790,39 +796,36 @@ class SAM2VideoPredictor(SAM2Base):
                 inference_state, all_pred_masks
             )
 
-            self.remove_totally_overlapping_masks(
+
+            self.remove_overlapping_masks(
                 inference_state,
-                contain_thresh=0.95,
-                debug=False,
-                current_masks=video_res_masks,  # <- use current frame masks
-                current_obj_ids=obj_ids,  # <- use current frame ids
+                iou_thresh=0.90,
+                current_masks=video_res_masks,
+                current_obj_ids=obj_ids,
             )
 
-            # === Handle deferred hard removals ===
-            # === Handle deferred full removals using remove_object() ===
+            # === Handle deferred HARD removals ===
             if hasattr(self, "_pending_hard_remove") and self._pending_hard_remove:
                 to_remove = list(self._pending_hard_remove)
-                print(f"\n[Frame {frame_idx}] Removing overlapped objects via remove_object(): {to_remove}")
+                print(f"\n[Frame {frame_idx}] HARD removing objects: {to_remove}")
+
                 for rid in to_remove:
                     try:
+                        # full strict removal → reindexing → safest version
                         self.remove_object(inference_state, rid, strict=False, need_output=False)
-                        print(f"[remove_object] ✅ Removed ID {rid}")
+                        inference_state["last_seen"].pop(rid, None)
+                        inference_state.get("occluded_ids", set()).discard(rid)
                     except Exception as e:
-                        print(f"[remove_object] ❌ Failed for {rid}: {e}")
+                        print(f"[HARD REMOVE ERROR] Could not remove {rid}: {e}")
 
                 self._pending_hard_remove.clear()
 
-                # ✅ Rebuild index mappings after any removals
-                inference_state["obj_idx_to_id"] = OrderedDict(enumerate(inference_state["obj_ids"]))
-                inference_state["obj_id_to_idx"] = {v: k for k, v in inference_state["obj_idx_to_id"].items()}
-                print(f"[debug-fix] Rebuilt mappings: obj_idx_to_id={inference_state['obj_idx_to_id']}")
-                print(f"[debug-fix] output_dict_per_obj keys={list(inference_state['output_dict_per_obj'].keys())}")
-
-            # === Refresh obj_ids for next stage ===
+            # Refresh obj_ids
             obj_ids = inference_state["obj_ids"]
             batch_size = self._get_obj_num(inference_state)
 
-            # === Return current frame output ===
+
+            # Return current frame output
             yield frame_idx, obj_ids, video_res_masks
 
     @torch.inference_mode()
@@ -1142,166 +1145,44 @@ class SAM2VideoPredictor(SAM2Base):
         return inference_state
 
     @torch.inference_mode()
-    def soft_remove_object(self, inference_state, obj_id):
-        """
-        Softly remove an object without reindexing other objects.
-        The object will be ignored in later propagation and outputs,
-        but its index slot remains valid (so no KeyError).
-        """
-        obj_idx = inference_state["obj_id_to_idx"].get(obj_id, None)
-        if obj_idx is None:
-            print(f"[soft_remove] ⚠️ Object {obj_id} not found, skipping.")
-            return inference_state
-
-        # --- Mark as removed ---
-        if "removed_obj_ids" not in inference_state:
-            inference_state["removed_obj_ids"] = set()
-        inference_state["removed_obj_ids"].add(obj_id)
-        print(f"[soft_remove] 🚫 Soft-removed object {obj_id} (idx={obj_idx})")
-
-        # --- Clear its memory to free GPU ---
-        def _clear_container(container):
-            if obj_idx in container:
-                container[obj_idx].clear()
-
-        _clear_container(inference_state["point_inputs_per_obj"])
-        _clear_container(inference_state["mask_inputs_per_obj"])
-        if obj_idx in inference_state["output_dict_per_obj"]:
-            inference_state["output_dict_per_obj"][obj_idx]["cond_frame_outputs"].clear()
-            inference_state["output_dict_per_obj"][obj_idx]["non_cond_frame_outputs"].clear()
-        if obj_idx in inference_state["temp_output_dict_per_obj"]:
-            inference_state["temp_output_dict_per_obj"][obj_idx]["cond_frame_outputs"].clear()
-            inference_state["temp_output_dict_per_obj"][obj_idx]["non_cond_frame_outputs"].clear()
-        if obj_idx in inference_state["frames_tracked_per_obj"]:
-            inference_state["frames_tracked_per_obj"][obj_idx].clear()
-
-        torch.cuda.empty_cache()
-        return inference_state
-
-    @torch.inference_mode()
-    def hard_remove_object(self, inference_state, obj_id):
-        """
-        Completely remove an object and free all memory.
-        Unlike soft_remove_object, this deletes all references so the ID is gone.
-        """
-        obj_id_to_idx = inference_state["obj_id_to_idx"]
-        obj_idx_to_id = inference_state["obj_idx_to_id"]
-        per_obj = inference_state["output_dict_per_obj"]
-        frames_per_obj = inference_state["frames_tracked_per_obj"]
-
-        if obj_id not in obj_id_to_idx:
-            print(f"[hard_remove] ⚠️ Object {obj_id} not found.")
-            return inference_state
-
-        obj_idx = obj_id_to_idx.pop(obj_id)
-        obj_idx_to_id.pop(obj_idx, None)
-
-        # Clear memory-heavy dicts
-        obj_dict = per_obj.pop(obj_idx, None)
-        if isinstance(obj_dict, dict):
-            for key in ("cond_frame_outputs", "non_cond_frame_outputs"):
-                if key in obj_dict:
-                    for out in obj_dict[key].values():
-                        for tkey in ("maskmem_features", "maskmem_pos_enc", "pred_masks"):
-                            if tkey in out and out[tkey] is not None:
-                                out[tkey] = None
-                    obj_dict[key].clear()
-
-        frames_per_obj.pop(obj_idx, None)
-        inference_state["point_inputs_per_obj"].pop(obj_idx, None)
-        inference_state["mask_inputs_per_obj"].pop(obj_idx, None)
-        inference_state["temp_output_dict_per_obj"].pop(obj_idx, None)
-
-        # Clean bookkeeping
-        for field in ("last_seen",):
-            if field in inference_state and obj_id in inference_state[field]:
-                inference_state[field].pop(obj_id)
-        for field in ("removed_obj_ids", "occluded_ids", "pending_remove"):
-            if field in inference_state and isinstance(inference_state[field], set):
-                inference_state[field].discard(obj_id)
-
-        # Remove from global list
-        if obj_id in inference_state["obj_ids"]:
-            inference_state["obj_ids"].remove(obj_id)
-
-        torch.cuda.empty_cache()
-        print(f"[hard_remove] 🧹 Fully removed object {obj_id}")
-        return inference_state
-
-    @torch.inference_mode()
-    def remove_totally_overlapping_masks(
+    def remove_overlapping_masks(
             self,
             inference_state,
-            contain_thresh: float = 0.95,
+            iou_thresh: float = 0.90,
             debug: bool = False,
-            current_masks: torch.Tensor | None = None,  # [N,1,H,W] logits at video res (this frame)
+            current_masks: torch.Tensor | None = None,  # [N,1,H,W]
             current_obj_ids: list[int] | None = None,
     ):
         """
-        Detect totally overlapping masks and MARK the smaller one for hard removal.
-        Actual removal is deferred to the end of the frame (in propagate_in_video).
-        If `current_masks` and `current_obj_ids` are provided, operate on those for this frame.
-        Otherwise, fall back to the most recent masks cached in `inference_state`.
+        Remove masks that are ≥90% similar (IoU ≥ iou_thresh).
+        This catches masks that overlap in both shape and position.
         """
-        # ---- get binary masks + ids ----
-        bin_masks = None
-        obj_ids = None
-
-        if current_masks is not None and current_obj_ids is not None and len(current_obj_ids) > 1:
-            # use current frame’s masks
-            with torch.no_grad():
-                bin_masks = (current_masks.detach().to("cpu") > 0).numpy().squeeze(1)  # [N,H,W]
-            obj_ids = list(current_obj_ids)
-        else:
-            # fallback to latest masks in state (older behavior)
-            if "output_dict_per_obj" not in inference_state or len(inference_state["output_dict_per_obj"]) <= 1:
-                return inference_state
-            obj_ids = list(inference_state["obj_id_to_idx"].keys())
-            masks_np = []
-            valid_ids = []
-            for oid in obj_ids:
-                oidx = inference_state["obj_id_to_idx"][oid]
-                o = inference_state["output_dict_per_obj"].get(oidx, {})
-                nonc = o.get("non_cond_frame_outputs", {})
-                cond = o.get("cond_frame_outputs", {})
-                if len(nonc) > 0:
-                    t = max(nonc.keys());
-                    m = nonc[t]["pred_masks"]
-                elif len(cond) > 0:
-                    t = max(cond.keys());
-                    m = cond[t]["pred_masks"]
-                else:
-                    continue
-                masks_np.append((m.detach().cpu().numpy() > 0).astype(np.uint8).squeeze())
-                valid_ids.append(oid)
-            if len(masks_np) <= 1:
-                return inference_state
-            bin_masks = np.stack(masks_np, 0)
-            obj_ids = valid_ids
-
-        if bin_masks is None or len(obj_ids) <= 1:
+        if current_masks is None or current_obj_ids is None or len(current_obj_ids) <= 1:
             return inference_state
 
-        # ---- compare pairwise containment ----
-        areas = [m.sum() for m in bin_masks]
-        marked = set()
+        masks = (current_masks > 0).float().squeeze(1)  # [N,H,W]
+        obj_ids = list(current_obj_ids)
         N = len(obj_ids)
+
+        areas = masks.sum(dim=[1, 2])  # [N]
+        marked = set()
+
+
         for i in range(N):
-            if areas[i] == 0:
+            if areas[i] < 5:
                 continue
             for j in range(i + 1, N):
-                if areas[j] == 0:
+                if areas[j] < 5:
                     continue
-                inter = np.logical_and(bin_masks[i], bin_masks[j]).sum()
-                smaller = min(areas[i], areas[j])
-                contain = inter / smaller if smaller > 0 else 0.0
-                if contain >= contain_thresh:
-                    smaller_id = obj_ids[j] if areas[i] >= areas[j] else obj_ids[i]
-                    marked.add(smaller_id)
-                    if debug:
-                        print(f"[MaskOverlap] mark hard-remove ID {smaller_id} (contain={contain:.3f})")
+                inter = (masks[i] * masks[j]).sum()
+                union = areas[i] + areas[j] - inter
+                if union <= 0:
+                    continue
+                iou = (inter / union).item()
+                if iou >= iou_thresh:
+                    remove_id = obj_ids[j] if areas[i] >= areas[j] else obj_ids[i]
+                    marked.add(remove_id)
 
-        # ---- stash for deferred hard removal ----
         if not hasattr(self, "_pending_hard_remove"):
             self._pending_hard_remove = set()
         self._pending_hard_remove.update(marked)
