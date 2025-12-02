@@ -53,6 +53,87 @@ def visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors, save_path
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         cv2.imwrite(save_path, frame)
 
+
+def full_visualize_tracking(
+        frame,
+        track_ids,
+        track_logits,
+        id_colors,
+        det_boxes=None,          # NEW: reshaped pose-based boxes
+        det_boxes_original=None, # NEW: original YOLO boxes
+        save_path=None):
+    """
+    Visualize:
+    1. SAM masks (colored)
+    2. SAM mask bbox        -> green
+    3. YOLO original bbox   -> orange
+    4. Pose-adjusted bbox   -> blue
+    """
+
+    vis = frame.copy()
+    H, W = frame.shape[:2]
+
+    # ------------------------------------
+    # 1. Draw SAM masks
+    # ------------------------------------
+    for idx, tid in enumerate(track_ids):
+        mask = (track_logits[idx] > 0).cpu().numpy().squeeze()
+
+        color = id_colors.setdefault(
+            tid, tuple(np.random.randint(0, 255, 3).tolist())
+        )
+
+        colored_mask = np.zeros_like(vis, dtype=np.uint8)
+        colored_mask[mask > 0] = color
+        vis = cv2.addWeighted(vis, 1.0, colored_mask, 0.45, 0)
+
+    # ------------------------------------
+    # 2. Draw SAM bboxes (GREEN)
+    # ------------------------------------
+    for idx, tid in enumerate(track_ids):
+        mask = (track_logits[idx] > 0).cpu().numpy().squeeze()
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            continue
+
+        x1, y1 = int(xs.min()), int(ys.min())
+        x2, y2 = int(xs.max()), int(ys.max())
+
+        cv2.rectangle(vis, (x1, y1), (x2, y2),
+                      (0, 255, 0), 1)  # green
+
+        cv2.putText(vis, f"ID {tid}", (x1, y1 - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    (0, 255, 0), 1)
+
+    # ------------------------------------
+    # 3. Draw YOLO ORIGINAL bboxes (ORANGE)
+    # ------------------------------------
+    if det_boxes_original is not None:
+        for box in det_boxes_original:
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(vis, (x1, y1), (x2, y2),
+                          (0, 165, 255), 1)  # orange
+            cv2.putText(vis, "O", (x1, y1 - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                        (0, 165, 255), 1)
+
+    # ------------------------------------
+    # 4. Draw POSE-RESHAPED bboxes (BLUE)
+    # ------------------------------------
+    if det_boxes is not None:
+        for box in det_boxes:
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(vis, (x1, y1), (x2, y2),
+                          (255, 0, 0), 1)  # blue
+            cv2.putText(vis, "P", (x1, y1 - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                        (255, 0, 0), 1)
+
+    if save_path:
+        cv2.imwrite(save_path, vis)
+
+
 # --- IOU helper ---
 def iou(a, b):
     xA, yA = max(a[0], b[0]), max(a[1], b[1])

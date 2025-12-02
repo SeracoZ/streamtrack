@@ -19,3 +19,6 @@ submit_results/
 tmp_chunk/
 score_distribution/
 kf_vis/
+mask_logs/
+exp/
+mask_plots/

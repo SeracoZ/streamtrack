@@ -13,7 +13,7 @@ from ultralytics import YOLO
 
 from filter import clean_mask
 from add import add_new_objects
-from vis import visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose
+from vis import visualize_tracking, iou, is_full_body, filter_overlapping_bboxes, adjust_box_to_pose, full_visualize_tracking
 
 
 def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quiet=False):
@@ -65,6 +65,10 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
     vis_dir = os.path.join("vis_results", os.path.basename(video_path)) if save_vis else None
     if vis_dir:
         os.makedirs(vis_dir, exist_ok=True)
+    save_mask = True
+    if save_mask:
+        mask_save_dir = os.path.join("mask_logs", os.path.basename(video_path))
+        os.makedirs(mask_save_dir, exist_ok=True)
 
     # === MAIN PROPAGATION LOOP ===
     with torch.no_grad():
@@ -200,12 +204,41 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
             '''
 
             # --- Save visualization frame only (no display) ---
+            VIS_FULL = False
             if save_vis:
                 save_path = os.path.join(vis_dir, f"{rel_idx:06d}.jpg")
-                visualize_tracking(frame, final_ids, final_logits, id_colors,
-                                   save_path=save_path)
+                if VIS_FULL:
+                    full_visualize_tracking(
+                        frame,
+                        final_ids,
+                        final_logits,
+                        id_colors,
+                        det_boxes=cur_boxes,  # pose-adjusted
+                        det_boxes_original=boxes_f,  # raw YOLO output
+                        save_path=save_path
+                    )
+                else:
+                    visualize_tracking(frame, final_ids, final_logits, id_colors,
+                                       save_path=save_path)
                 #visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors,
                                    #save_path=save_path)
+            # === SAVE MASKS FOR OFFLINE ANALYSIS ===
+            frame_dir = os.path.join(mask_save_dir, f"{rel_idx:06d}")
+            os.makedirs(frame_dir, exist_ok=True)
+
+            for idx, tid in enumerate(final_ids):
+                mask = (final_logits[idx] > 0).cpu().numpy().squeeze().astype(np.uint8)
+
+                save_path = os.path.join(frame_dir, f"id_{tid}.npy")
+                np.save(save_path, mask)
+
+                # Save bbox
+                bbox_path = os.path.join(frame_dir, f"id_{tid}_bbox.npy")
+                np.save(bbox_path, np.array([x1, y1, x2, y2], dtype=np.float32))
+
+                # Save logits (optional, for front/back occlusion analysis)
+                logit_path = os.path.join(frame_dir, f"id_{tid}_logits.npy")
+                np.save(logit_path, final_logits[idx].cpu().numpy())
 
             torch.cuda.empty_cache()
 
@@ -222,7 +255,7 @@ def main():
         if not os.path.isdir(img_dir):
             continue
         #test_list = sorted(os.listdir(split_dir))[11]
-        test_list = sorted(os.listdir(split_dir))[1]
+        test_list = sorted(os.listdir(split_dir))[7]
         if seq not in test_list:
             continue
 
