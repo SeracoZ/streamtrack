@@ -796,13 +796,14 @@ class SAM2VideoPredictor(SAM2Base):
                 inference_state, all_pred_masks
             )
 
-
+            '''
             self.remove_overlapping_masks(
                 inference_state,
                 iou_thresh=0.90,
                 current_masks=video_res_masks,
                 current_obj_ids=obj_ids,
             )
+            '''
 
             # === Handle deferred HARD removals ===
             if hasattr(self, "_pending_hard_remove") and self._pending_hard_remove:

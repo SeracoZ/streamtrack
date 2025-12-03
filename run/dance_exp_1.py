@@ -284,23 +284,21 @@ def run_sequence(predictor, video_path, frame_names, writer, save_vis=True, quie
                                        save_path=save_path)
                 #visualize_tracking(frame, out_obj_ids, out_mask_logits, id_colors,
                                    #save_path=save_path)
-            # === SAVE MASKS FOR OFFLINE ANALYSIS ===
-            frame_dir = os.path.join(mask_save_dir, f"{rel_idx:06d}")
-            os.makedirs(frame_dir, exist_ok=True)
-
+            # === SAVE MASK IMAGES PER ID (ONE FOLDER PER ID) ===
             for idx, tid in enumerate(final_ids):
+                # 1. ID folder
+                id_dir = os.path.join(mask_save_dir, f"id_{tid}")
+                os.makedirs(id_dir, exist_ok=True)
+
+                # 2. Get mask as uint8
                 mask = (final_logits[idx] > 0).cpu().numpy().squeeze().astype(np.uint8)
 
-                save_path = os.path.join(frame_dir, f"id_{tid}.npy")
-                np.save(save_path, mask)
+                # 3. Convert to 0/255 image for visualization
+                mask_img = (mask * 255).astype(np.uint8)
 
-                # Save bbox
-                bbox_path = os.path.join(frame_dir, f"id_{tid}_bbox.npy")
-                np.save(bbox_path, np.array([x1, y1, x2, y2], dtype=np.float32))
-
-                # Save logits (optional, for front/back occlusion analysis)
-                logit_path = os.path.join(frame_dir, f"id_{tid}_logits.npy")
-                np.save(logit_path, final_logits[idx].cpu().numpy())
+                # 4. Save image
+                save_path = os.path.join(id_dir, f"frame_{rel_idx:06d}.png")
+                cv2.imwrite(save_path, mask_img)
 
             torch.cuda.empty_cache()
 

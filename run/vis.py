@@ -2,6 +2,32 @@ import cv2
 import numpy as np
 import os
 
+def draw_text_block(frame, lines, origin="top-left"):
+    """
+    Draw multiple lines of text in a fixed corner without overlap.
+
+    lines: list of (text, (B,G,R))
+    origin: "top-left", "top-right", "bottom-left", "bottom-right"
+    """
+
+    h, w = frame.shape[:2]
+    dy = 28  # line spacing
+
+    if origin == "top-left":
+        x0, y0 = 20, 30
+    elif origin == "top-right":
+        x0, y0 = w - 320, 30
+    elif origin == "bottom-left":
+        x0, y0 = 20, h - 30 - dy * len(lines)
+    elif origin == "bottom-right":
+        x0, y0 = w - 320, h - 30 - dy * len(lines)
+    else:
+        x0, y0 = 20, 30
+
+    for i, (txt, color) in enumerate(lines):
+        y = y0 + i * dy
+        cv2.putText(frame, txt, (x0, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
 def draw_score_on_frame(frame, box, obj_id, occ_info, qual_info):
     """
