@@ -10,4 +10,4 @@
 
 TODO:
 Stable the id.
-Don't update the occlusion part.
+Use a tracker to help the SAM2 better track.
