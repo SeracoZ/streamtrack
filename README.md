@@ -11,3 +11,5 @@
 TODO:
 Stable the id.
 Use a tracker to help the SAM2 better track.
+Use OC-SORT as a co-tracker.
+Build a combination of mask and bbox.
